@@ -174,7 +174,7 @@ def trigger_missing_data_fetch(missing_lakes: list, work_dir: Path):
     log(f"📥 Triggering data fetch for: {lakes_arg}")
     cmd = [
         sys.executable,
-        str(work_dir / "batch_download_manager.py"),
+        str(work_dir / "pipelines" / "satellite" / "batch_download_manager.py"),
         "--lakes", lakes_arg,
         "--start", "2022",
         "--end", "2024",
