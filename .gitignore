@@ -8,6 +8,9 @@ build/
 
 # Secrets
 .env
+*earthdata_token*.json
+*_token.json
+*.token.json
 
 # Tauri
 tauri/node_modules/
@@ -25,8 +28,16 @@ cesarops-slicer/target/
 # Outputs
 outputs/
 
+# Database files (large, machine-specific — init via init_database.py)
+db/*.db
+db/*.db-shm
+db/*.db-wal
+
 # Downloaded satellite data (large binary files, not for git)
 downloads/
+
+# Bagrecovery (large incoming archive - do not commit)
+incomming/
 
 # Syncthing
 .stfolder/

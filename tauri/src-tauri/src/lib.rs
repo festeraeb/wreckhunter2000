@@ -9,10 +9,30 @@
 
 mod nasa_agent;
 
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use serde::{Deserialize, Serialize};
+
+// ── Backend process lifecycle state ─────────────────────────────────────────
+
+struct BackendInner {
+    url: Option<String>,
+    child: Option<std::process::Child>,
+}
+
+struct BackendState(Arc<Mutex<BackendInner>>);
+
+/// Find a free TCP port by binding to :0 and reading the assigned port.
+fn find_free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("no free TCP port")
+        .local_addr()
+        .unwrap()
+        .port()
+}
 
 /// Resolve the cesarops-core directory relative to this binary's location.
 /// Falls back to the current working directory if not found.
@@ -300,6 +320,69 @@ fn get_work_dir() -> String {
     resolve_core_dir().to_string_lossy().to_string()
 }
 
+/// Ensure the Python FastAPI backend (wrecks_api) is running.
+/// Starts uvicorn on a dynamically assigned free port, waits for it to accept
+/// TCP connections, then returns the base URL as `http://127.0.0.1:{port}`.
+/// Subsequent calls return the cached URL immediately.
+#[tauri::command]
+async fn ensure_backend(state: tauri::State<'_, BackendState>) -> Result<String, String> {
+    // Fast path: already running
+    {
+        let lock = state.0.lock().map_err(|e| e.to_string())?;
+        if let Some(ref url) = lock.url {
+            return Ok(url.clone());
+        }
+    }
+
+    let core_dir = resolve_core_dir();
+    let port = find_free_port();
+    let url = format!("http://127.0.0.1:{}", port);
+
+    let mut cmd = Command::new("python");
+    cmd.args([
+        "-m", "uvicorn",
+        "wrecks_api.app:app",
+        "--host", "127.0.0.1",
+        "--port", &port.to_string(),
+        "--no-access-log",
+    ]);
+    cmd.current_dir(&core_dir);
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    let child = cmd.spawn()
+        .map_err(|e| format!("Failed to start uvicorn backend: {e}\nPython path: {}\nCheck that uvicorn is installed: pip install uvicorn fastapi", core_dir.display()))?;
+
+    // Wait up to 20s for the port to accept connections (blocking in thread pool)
+    let port_copy = port;
+    tauri::async_runtime::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if let Ok(addr) = format!("127.0.0.1:{port_copy}").parse::<std::net::SocketAddr>() {
+                if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("Backend did not start within 20 s on port {port_copy}. Ensure uvicorn and fastapi are installed."));
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("Thread error: {e}"))??;
+
+    // Cache URL and keep child alive
+    {
+        let mut lock = state.0.lock().map_err(|e| e.to_string())?;
+        lock.url = Some(url.clone());
+        lock.child = Some(child);
+    }
+
+    Ok(url)
+}
+
 /// List known wrecks
 #[tauri::command]
 async fn list_wrecks(work_dir: String) -> Result<String, String> {
@@ -317,7 +400,14 @@ async fn list_wrecks(work_dir: String) -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Shared Arc so the exit handler can kill the uvicorn child without
+    // borrowing through AppHandle::state() (avoids lifetime issues in Tauri v2).
+    let backend_arc: Arc<Mutex<BackendInner>> =
+        Arc::new(Mutex::new(BackendInner { url: None, child: None }));
+    let arc_for_exit = backend_arc.clone();
+
     tauri::Builder::default()
+        .manage(BackendState(backend_arc))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -328,9 +418,20 @@ pub fn run() {
             check_nodes,
             list_wrecks,
             get_work_dir,
+            ensure_backend,
             nasa_agent::search_nasa_granules,
             nasa_agent::trigger_swarm_download,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(move |_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Kill the uvicorn child process when the app exits
+                if let Ok(mut inner) = arc_for_exit.lock() {
+                    if let Some(ref mut child) = inner.child {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        });
 }
