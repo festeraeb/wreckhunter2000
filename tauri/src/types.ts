@@ -341,4 +341,4 @@ export interface HarvesterResult {
 export type ActivePanel =
   | "list" | "detail" | "stats" | "scan" | "mag" | "erie"
   | "restore" | "pdf" | "map" | "export" | "loran" | "sensors"
-  | "harvest" | "agent";
+  | "harvest" | "agent" | "mission";

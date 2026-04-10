@@ -12,10 +12,12 @@ import MapPanel from "./components/MapPanel";
 import PDFBreakerPanel from "./components/PDFBreakerPanel";
 import ExportPanel from "./components/ExportPanel";
 import AgentPanel from "./components/AgentPanel";
+import MissionControlPanel from "./components/MissionControlPanel";
 import LoranPanel from "./components/LoranPanel";
 import ExtendedSensorsPanel from "./components/ExtendedSensorsPanel";
 import HarvesterPanel from "./components/HarvesterPanel";
 import AutoBagPrompt from "./components/AutoBagPrompt";
+import UpdateChecker from "./components/UpdateChecker";
 import { getApiBase, resetConnectionState } from "./services/api";
 import "./styles/global.css";
 
@@ -74,6 +76,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <AutoBagPrompt />
+      <UpdateChecker />
       {/* ── Top bar ────────────────────────────────────── */}
       <div className="topbar">
         <div className="topbar-brand">
@@ -155,6 +158,9 @@ export default function App() {
         <button className={panel === "erie" ? "active" : ""} onClick={() => setPanel("erie")}>
           🌊 Lake Erie Scanner
         </button>
+        <button className={panel === "mission" ? "active" : ""} onClick={() => setPanel("mission")}>
+          🎯 Mission Control
+        </button>
         <button className={panel === "pdf" ? "active" : ""} onClick={() => setPanel("pdf")}>
           📄 PDF Redactor
         </button>
@@ -223,6 +229,9 @@ export default function App() {
         </div>
         <div style={{ display: panel === "agent" ? "block" : "none", height: '100%' }}>
           <AgentPanel />
+        </div>
+        <div style={{ display: panel === "mission" ? "block" : "none", height: '100%' }}>
+          <MissionControlPanel />
         </div>
         <div style={{ display: panel === "detail" ? "block" : "none", height: '100%' }}>
           {selectedWreck && <WreckDetail wreck={selectedWreck} onBack={() => setPanel("list")} />}

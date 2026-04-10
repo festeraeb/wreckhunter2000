@@ -51,6 +51,15 @@
       ],
       "label": "Straits of Mackinac"
     },
+    "erie_mb2_zone": {
+      "bbox": [
+        41.80,
+        -82.50,
+        42.50,
+        -80.00
+      ],
+      "label": "Erie Central Basin — Marquette & Bessemer No. 2 Search Zone"
+    },
     "superior_deep_basin": {
       "bbox": [
         46.5,
@@ -2010,6 +2019,26 @@
       "preserve": "Sanilac Shores Underwater Preserve",
       "coord_quality": "preserve_registry",
       "confidence": "confirmed",
+      "sensors_tested": [],
+      "probe_results": []
+    },
+    "marquette_bessemer_no2": {
+      "name": "Marquette and Bessemer No. 2",
+      "category": [
+        "search_area"
+      ],
+      "search_notes": "Car ferry lost December 7, 1909 en route from Conneaut OH to Port Stanley ON. Disappeared with 36 crew during a violent snowstorm. Exact wreck location unknown — believed to lie in the central or eastern Erie basin at depth 40–200ft. Steel hull, 350ft length. Priority Erie target.",
+      "lat_min": 41.80,
+      "lat_max": 42.50,
+      "lon_min": -82.50,
+      "lon_max": -80.00,
+      "depth_ft": 100,
+      "year_lost": 1909,
+      "type": "steel_car_ferry",
+      "length_ft": 350,
+      "confidence": "unconfirmed_location",
+      "lake": "erie",
+      "source": "historical_record",
       "sensors_tested": [],
       "probe_results": []
     }

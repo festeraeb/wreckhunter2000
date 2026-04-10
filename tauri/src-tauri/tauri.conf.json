@@ -26,10 +26,20 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/festeraeb/wreckhunter2000/releases/latest/download/latest.json"
+      ],
+      "dialog": true,
+      "pubkey": "PASTE_YOUR_PUBLIC_KEY_HERE"
+    }
   }
 }

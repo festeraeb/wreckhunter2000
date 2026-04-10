@@ -27,6 +27,7 @@ if sys.platform == 'win32':
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import requests
@@ -181,6 +182,36 @@ BOUNDING_BOXES = {
         'lon_min': -84.80, 'lon_max': -84.40,
         'targets': [],
     },
+    'lake_erie': {
+        'name': 'Lake Erie (full)',
+        'lat_min': 41.30, 'lat_max': 42.50,
+        'lon_min': -83.50, 'lon_max': -78.80,
+        'targets': ['Anthony Wayne', 'Atlantic', 'Dean Richmond'],
+    },
+    'erie_central_basin': {
+        'name': 'Erie Central Basin — Marquette & Bessemer No. 2',
+        'lat_min': 41.80, 'lat_max': 42.50,
+        'lon_min': -82.50, 'lon_max': -80.00,
+        'targets': ['Marquette', 'Bessemer', 'Marquette and Bessemer', 'MB2', 'M&B2'],
+    },
+    'lake_huron': {
+        'name': 'Lake Huron',
+        'lat_min': 43.00, 'lat_max': 46.50,
+        'lon_min': -84.00, 'lon_max': -79.50,
+        'targets': [],
+    },
+    'lake_ontario': {
+        'name': 'Lake Ontario',
+        'lat_min': 43.20, 'lat_max': 44.20,
+        'lon_min': -79.90, 'lon_max': -76.00,
+        'targets': [],
+    },
+    'lake_superior': {
+        'name': 'Lake Superior',
+        'lat_min': 46.40, 'lat_max': 48.20,
+        'lon_min': -92.00, 'lon_max': -84.40,
+        'targets': [],
+    },
 }
 
 # ── Tool metadata (sent to Qwen as reference) ────────────────────────────────
@@ -231,6 +262,68 @@ AVAILABLE_TOOLS = {
         'default_threshold': 2.0,
         'best_for': ['depth verification', 'seafloor mapping'],
     },
+    # ── Mission-level tools (call cesarops_mission.py) ────────────────────
+    'nauticuvs': {
+        'script': 'cesarops_mission.py',
+        'description': 'NauticUVs multi-scale Laplacian-of-Gaussian blob detector on B02+B10 — hull curvature energy proxy',
+        'default_threshold': 3.5,
+        'best_for': ['buried hull curvature', 'soft-bottom detection', 'LoG energy peaks'],
+        'mission_pass': 'nauticuvs',
+        'mission_params': {'nauticuvs': {'enabled': True, 'energy_threshold': 3.5, 'top_n': 50}},
+    },
+    'hydrocarbon': {
+        'script': 'cesarops_mission.py',
+        'description': 'HC pass — B11 SWIR dark anomaly + B04 Red bright confirm (oil sheen / fuel slick)',
+        'default_threshold': -1.8,
+        'best_for': ['oil slicks', 'fuel leaks', 'hydrocarbon seep over wreck site'],
+        'mission_pass': 'hydrocarbon',
+        'mission_params': {'hydrocarbon': {'enabled': True, 'swir_thresh': -1.8, 'red_thresh': 1.5}},
+    },
+    'stumpf': {
+        'script': 'cesarops_mission.py',
+        'description': 'Stumpf log-ratio B02/B03 bathymetric shallow anomaly — hard structures in clear water',
+        'default_threshold': 2.0,
+        'best_for': ['shallow hull outline', 'clear-water detection', 'structural bottom anomaly'],
+        'mission_pass': 'stumpf',
+        'mission_params': {'stumpf': {'enabled': True, 'threshold': 2.0}},
+    },
+    'swir_silt_erasure': {
+        'script': 'cesarops_mission.py',
+        'description': 'B11/B12 SWIR ratio — reveals ferrous metal beneath silt (M&B2 / Erie specialist)',
+        'default_threshold': 2.5,
+        'best_for': ['sub-silt wreck detection', 'silted-over steel hull', 'Lake Erie central basin'],
+        'mission_pass': 'swir_silt_erasure',
+        'mission_params': {'swir_silt_erasure': {'enabled': True, 'threshold': 2.5, 'top_n': 30}},
+    },
+    'mussel_clearspot': {
+        'script': 'cesarops_mission.py',
+        'description': 'Positive B02 anomaly in turbid Erie background — Dreissenid mussel colony on wreck',
+        'default_threshold': 2.0,
+        'best_for': ['Marquette & Bessemer No. 2', 'Erie mussel colonies', 'wreck ecosystem signal'],
+        'mission_pass': 'mussel_clearspot',
+        'mission_params': {'mussel_clearspot': {'enabled': True, 'threshold': 2.0, 'top_n': 30}},
+    },
+    'mission_triple_lock_erie': {
+        'script': 'cesarops_mission.py',
+        'description': 'Triple Lock Lake Erie — HC + Thermal + NauticUVs simultaneously',
+        'default_threshold': None,
+        'best_for': ['Lake Erie multi-sensor confirmation', 'oil leak detection', 'Erie wreck search'],
+        'mission_preset': 'triple_lock_erie',
+    },
+    'mission_mb2': {
+        'script': 'cesarops_mission.py',
+        'description': 'Full M&B2 wreck hunt — all 7 passes on Erie central basin',
+        'default_threshold': None,
+        'best_for': ['Marquette and Bessemer No. 2', 'all-pass Erie central basin scan'],
+        'mission_preset': 'mb2_wreck_hunt',
+    },
+    'mission_straits': {
+        'script': 'cesarops_mission.py',
+        'description': 'Triple Lock Straits of Mackinac — HC + Thermal + NauticUVs + Stumpf',
+        'default_threshold': None,
+        'best_for': ['Straits', 'Mackinac', 'Line 5 area', 'Line5 wreck'],
+        'mission_preset': 'straits_triple_lock',
+    },
 }
 
 
@@ -276,14 +369,31 @@ def _build_system_prompt() -> str:
             f"  {tid}: {tinfo['description']} "
             f"(best for: {', '.join(tinfo['best_for'])})\n"
         )
+    prompt += (
+        "\nMission presets (use tool id 'mission_triple_lock_erie', 'mission_mb2', "
+        "or 'mission_straits' to run a full multi-pass mission):\n"
+        "  mission_triple_lock_erie — HC + Thermal + NauticUVs on full Lake Erie\n"
+        "  mission_mb2             — All 7 passes on Erie central basin (M&B2 wreck hunt)\n"
+        "  mission_straits         — HC + Thermal + NauticUVs + Stumpf on Straits\n"
+        "\nSingle-pass mission tools (run one pass only on any bbox):\n"
+        "  nauticuvs       — NauticUVs LoG blob on B02+B10 (hull curvature energy)\n"
+        "  hydrocarbon     — B11 SWIR dark + B04 Red bright (oil slick / fuel leak)\n"
+        "  stumpf          — B02/B03 log-ratio bathymetric shallow anomaly\n"
+        "  swir_silt_erasure — B11/B12 ratio: ferrous metal under silt (Erie specialist)\n"
+        "  mussel_clearspot  — Positive B02 bias: Dreissenid mussel colony on wreck\n"
+    )
     # Inject knowledge base context
     prompt += "\n" + build_knowledge_context() + "\n"
     prompt += "\n" + build_satellite_context() + "\n"
     prompt += (
         "\nRules:\n"
         "- If the user mentions a known wreck name, pick the matching bbox.\n"
+        "- If the user mentions Lake Erie, oil leak, or Line 5, default to 'lake_erie'.\n"
+        "- If the user mentions Marquette, Bessemer, M&B2, or central basin, default to 'erie_central_basin'.\n"
         "- If unclear, default to 'lake_michigan_south'.\n"
         "- Always include at least one tool.\n"
+        "- For multi-sensor confidence use mission tools (mission_triple_lock_erie etc.) not just 'triple_lock'.\n"
+        "- Use 'nauticuvs' specifically when hull curvature, buried structure, or soft-bottom detection is requested.\n"
         "- Use sensitivity 2.0 unless the user says 'aggressive' (1.0) or 'conservative/strict' (3.0).\n"
         "- Use web search to check weather/cloud cover AND wind history for the scan area. "
         "Best scanning is 12-48 hours AFTER a storm with 20-40mph winds — silt plumes "
@@ -412,28 +522,66 @@ class AIDirector:
 
         # Keyword matching fallback
         request_lower = request.lower()
+
+        # ── Bbox routing ───────────────────────────────────────────────────
         bbox_name = None
-        for name, bbox in BOUNDING_BOXES.items():
-            if any(kw in request_lower for kw in name.lower().split('_')):
-                bbox_name = name
+        # Explicit lake/area keywords first
+        _BB_KEYWORDS = [
+            (['lake erie', 'erie full', 'erie scan'],            'lake_erie'),
+            (['central basin', 'mb2', 'm&b2', 'marquette bessemer',
+              'marquette and bessemer', 'bessemer no. 2'],        'erie_central_basin'),
+            (['straits', 'mackinac', 'line 5', 'line5'],         'straits_of_mackinac'),
+            (['lake michigan south', 'andaste', 'chicorah'],      'lake_michigan_south'),
+            (['lake michigan north', 'lake michigan'],            'lake_michigan_north'),
+            (['fox islands', 'gilcher'],                          'fox_islands'),
+            (['beaver islands', 'parnell'],                       'beaver_islands'),
+            (['lake huron', 'huron'],                             'lake_huron'),
+            (['lake ontario', 'ontario'],                         'lake_ontario'),
+            (['lake superior', 'superior'],                       'lake_superior'),
+        ]
+        for kws, bname in _BB_KEYWORDS:
+            if any(kw in request_lower for kw in kws):
+                bbox_name = bname
                 break
-            if any(t.lower() in request_lower for t in bbox.get('targets', [])):
-                bbox_name = name
-                break
+        # Fallback: scan BOUNDING_BOXES targets
+        if not bbox_name:
+            for name, bbox in BOUNDING_BOXES.items():
+                if any(kw in request_lower for kw in name.lower().split('_')):
+                    bbox_name = name
+                    break
+                if any(t.lower() in request_lower for t in bbox.get('targets', [])):
+                    bbox_name = name
+                    break
 
         tools = []
         keyword_map = {
-            ('thermal', 'cold', 'heat', 'sink'): 'thermal',
-            ('optical', 'glint', 'aluminum', 'aircraft'): 'optical',
-            ('sar', 'vv', 'vh', 'radar'): 'sar',
-            ('fusion', 'triple', 'lock', 'verify'): 'triple_lock',
-            ('swot', 'displacement', 'mass'): 'swot',
-            ('icesat', 'atl13', 'bathy', 'depth'): 'atl13',
-            ('vrt', 'stack', 'multi-source', 'multi source'): 'vrt_slicer',
+            ('thermal', 'cold', 'heat', 'sink'):                           'thermal',
+            ('optical', 'glint', 'aluminum', 'aircraft'):                  'optical',
+            ('sar', 'vv', 'vh', 'radar'):                                  'sar',
+            ('fusion', 'triple lock', 'triple_lock', 'verify'):            'triple_lock',
+            ('swot', 'displacement', 'mass'):                              'swot',
+            ('icesat', 'atl13', 'bathy', 'depth'):                         'atl13',
+            ('vrt', 'stack', 'multi-source', 'multi source'):              'vrt_slicer',
+            ('nauticuvs', 'nautic', 'log blob', 'laplacian', 'curvelet'): 'nauticuvs',
+            ('hydrocarbon', 'hc pass', 'oil slick', 'fuel leak', 'swir'):  'hydrocarbon',
+            ('stumpf', 'bathymetric', 'log ratio', 'shallow hull'):        'stumpf',
+            ('swir silt', 'silt erasure', 'sub-silt', 'subsilt'):          'swir_silt_erasure',
+            ('mussel', 'clearspot', 'dreissenid', 'clear spot'):           'mussel_clearspot',
+            ('mission erie', 'triple lock erie', 'erie triple'):           'mission_triple_lock_erie',
+            ('mission mb2', 'mb2 hunt', 'bessemer hunt'):                  'mission_mb2',
+            ('mission straits', 'straits triple'):                         'mission_straits',
         }
         for kws, tool in keyword_map.items():
             if any(kw in request_lower for kw in kws):
                 tools.append(tool)
+
+        # ── Smart Erie defaults ────────────────────────────────────────────
+        if bbox_name in ('lake_erie', 'erie_central_basin') and not tools:
+            tools = ['hydrocarbon', 'thermal', 'nauticuvs']
+        elif bbox_name == 'erie_central_basin' and not any(t in tools for t in
+                ('swir_silt_erasure', 'mussel_clearspot', 'mission_mb2')):
+            tools += ['swir_silt_erasure', 'mussel_clearspot']
+
         if not tools:
             tools = ['thermal', 'optical']
 
@@ -480,6 +628,10 @@ class AIDirector:
         script_path = Path(__file__).parent / tool['script']
         sensor_threshold = tool.get('default_threshold', 2.0)
 
+        # ── Mission-level tools route through cesarops_mission.py ─────────
+        if 'mission_preset' in tool or 'mission_pass' in tool:
+            return self._run_mission_tool(tool_name, tool)
+
         if not script_path.exists():
             return {'tool': tool_name, 'success': False,
                     'error': f'Script not found: {script_path}'}
@@ -513,6 +665,86 @@ class AIDirector:
         except subprocess.TimeoutExpired:
             return {'tool': tool_name, 'success': False,
                     'error': 'Timed out (10 min)'}
+        except Exception as e:
+            return {'tool': tool_name, 'success': False, 'error': str(e)}
+
+    def _run_mission_tool(self, tool_name: str, tool: dict) -> dict:
+        """Dispatch a tool that maps to cesarops_mission.py."""
+        mission_script = Path(__file__).parent / 'cesarops_mission.py'
+        if not mission_script.exists():
+            return {'tool': tool_name, 'success': False, 'error': 'cesarops_mission.py not found'}
+
+        bbox = self.config.get('bbox') or {}
+        bbox_arr = [
+            bbox.get('lat_min', 41.30), bbox.get('lon_min', -83.50),
+            bbox.get('lat_max', 42.50), bbox.get('lon_max', -78.80),
+        ]
+        sensitivity = self.config.get('sensitivity', 2.0)
+        # Map sensitivity → thresholds: 1.0 aggressive = lower sigmas, 3.0 = higher
+        sigma_scale = sensitivity  # 2.0 = default
+
+        if 'mission_preset' in tool:
+            # Use a named built-in preset
+            mission = {'preset': tool['mission_preset']}
+            cmd = [sys.executable, str(mission_script),
+                   '--preset', tool['mission_preset']]
+        else:
+            # Build a custom single-pass mission JSON
+            pass_params = dict(tool.get('mission_params', {}))
+            # Apply sensitivity scaling to thresholds
+            for pname, pcfg in pass_params.items():
+                if 'threshold' in pcfg:
+                    pcfg['threshold'] = round(float(pcfg['threshold']) * (sigma_scale / 2.0), 2)
+                if 'energy_threshold' in pcfg:
+                    pcfg['energy_threshold'] = round(float(pcfg['energy_threshold']) * (sigma_scale / 2.0), 2)
+
+            # All other passes disabled
+            all_passes = {
+                'standard':          {'enabled': False, 'threshold': 1.5},
+                'hydrocarbon':       {'enabled': False, 'swir_thresh': -1.8, 'red_thresh': 1.5},
+                'thermal':           {'enabled': False, 'threshold': 2.0},
+                'stumpf':            {'enabled': False, 'threshold': 2.0},
+                'nauticuvs':         {'enabled': False, 'energy_threshold': 3.5, 'top_n': 50},
+                'swir_silt_erasure': {'enabled': False, 'threshold': 2.5, 'top_n': 30},
+                'mussel_clearspot':  {'enabled': False, 'threshold': 2.0, 'top_n': 30},
+            }
+            all_passes.update(pass_params)
+
+            data_dirs = ['downloads/erie', 'downloads/hls']
+            if bbox_arr[0] > 44.0:  # Northern lakes
+                data_dirs = ['downloads/michigan', 'downloads/straits', 'downloads/hls']
+
+            output_tag = re.sub(r'[^\w\-]', '_',
+                f"{tool_name}_{bbox.get('name','area').lower().replace(' ','_')}")
+
+            mission_json = json.dumps({
+                'name': f"{tool['description'][:60]}",
+                'bbox': bbox_arr,
+                'output_tag': output_tag,
+                'data_dirs': data_dirs,
+                'passes': all_passes,
+                'sub_zones': [],
+            })
+            cmd = [sys.executable, str(mission_script), '--mission-json', mission_json]
+
+        import copy as _copy
+        child_env = _copy.copy(dict(os.environ))
+        for k, v in _dotenv.items():
+            child_env[k] = v
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=1200, env=child_env,
+            )
+            return {
+                'tool': tool_name,
+                'success': result.returncode == 0,
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'returncode': result.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {'tool': tool_name, 'success': False, 'error': 'Timed out (20 min)'}
         except Exception as e:
             return {'tool': tool_name, 'success': False, 'error': str(e)}
 

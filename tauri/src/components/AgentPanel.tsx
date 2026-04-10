@@ -11,12 +11,72 @@ interface TaskEntry {
   status: string;
 }
 
+type AgentProvider = "qwen" | "koboldcpp" | "github_sdk";
+
+const PROVIDER_MODEL_PRESETS: Record<AgentProvider, Array<{ value: string; label: string }>> = {
+  qwen: [
+    { value: "qwen3.6-plus", label: "Qwen 3.6 Plus" },
+    { value: "qwen-plus", label: "Qwen Plus" },
+    { value: "qwen-turbo", label: "Qwen Turbo" },
+  ],
+  koboldcpp: [
+    { value: "DeepSeek-R1-Distill-Qwen-7B", label: "DeepSeek-R1 Distill Qwen 7B (free, reasoned)" },
+    { value: "Qwen2.5-7B-Instruct-Q4_K_M", label: "Qwen2.5 7B Instruct" },
+    { value: "Qwen2.5-14B-Instruct-Q4_K_M", label: "Qwen2.5 14B Instruct" },
+    { value: "Mistral-7B-Instruct-v0.3", label: "Mistral 7B Instruct" },
+  ],
+  github_sdk: [
+    { value: "gpt-4.1", label: "GPT-4.1" },
+    { value: "gpt-4.1-mini", label: "GPT-4.1 Mini" },
+    { value: "o4-mini", label: "o4-mini" },
+  ],
+};
+
 export default function AgentPanel() {
   const [request, setRequest] = useState("");
   const [output, setOutput] = useState("");
   const [running, setRunning] = useState(false);
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [workDir, setWorkDir] = useState("");
+  const [provider, setProvider] = useState<AgentProvider>("qwen");
+  const [modelPreset, setModelPreset] = useState<string>("custom");
+  const [customModel, setCustomModel] = useState<string>("DeepSeek-R1-Distill-Qwen-7B");
+  const [statusChecking, setStatusChecking] = useState(false);
+
+  const effectiveModel = modelPreset === "custom" ? customModel.trim() : modelPreset;
+
+  useEffect(() => {
+    const saved = localStorage.getItem("agent_provider");
+    if (saved === "qwen" || saved === "koboldcpp" || saved === "github_sdk") {
+      setProvider(saved);
+    }
+
+    const savedPreset = localStorage.getItem("agent_model_preset");
+    if (savedPreset) setModelPreset(savedPreset);
+
+    const savedCustom = localStorage.getItem("agent_model_custom");
+    if (savedCustom) setCustomModel(savedCustom);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("agent_provider", provider);
+  }, [provider]);
+
+  useEffect(() => {
+    localStorage.setItem("agent_model_preset", modelPreset);
+  }, [modelPreset]);
+
+  useEffect(() => {
+    localStorage.setItem("agent_model_custom", customModel);
+  }, [customModel]);
+
+  useEffect(() => {
+    const presets = PROVIDER_MODEL_PRESETS[provider];
+    const isKnown = presets.some((p) => p.value === modelPreset);
+    if (!isKnown && modelPreset !== "custom") {
+      setModelPreset(presets[0]?.value ?? "custom");
+    }
+  }, [provider, modelPreset]);
 
   // Resolve work directory — ask Rust for the absolute path so it works
   // in both dev (tauri/) and release (tauri/src-tauri/target/release/) modes.
@@ -46,11 +106,13 @@ export default function AgentPanel() {
       const result: any = await invoke("ai_direct_request", {
         request,
         workDir: workDir || "..",
+        provider,
+        modelOverride: effectiveModel || undefined,
       });
       setOutput(result.stdout || "");
       if (result.stderr) setOutput((prev) => prev + "\n\n--- stderr ---\n" + result.stderr);
       addTask(
-        `ai_director.py --request "${request.slice(0, 60)}..." --execute`,
+        `[${provider}:${effectiveModel || "default"}] ai_director.py --request "${request.slice(0, 60)}..." --execute`,
         (result.stdout || "").slice(-200),
         (result.stderr || "").slice(-200),
         result.status
@@ -58,13 +120,41 @@ export default function AgentPanel() {
     } catch (e: any) {
       setOutput(`Error: ${e}`);
       addTask(
-        `ai_director.py --request "${request.slice(0, 60)}..." --execute`,
+        `[${provider}:${effectiveModel || "default"}] ai_director.py --request "${request.slice(0, 60)}..." --execute`,
         "",
         String(e),
         "error"
       );
     }
     setRunning(false);
+  };
+
+  const handleProviderStatus = async () => {
+    setStatusChecking(true);
+    try {
+      const status = await invoke<string>("agent_provider_status", {
+        provider,
+        workDir: workDir || "..",
+        modelOverride: effectiveModel || undefined,
+      });
+      setOutput(status);
+      addTask(
+        `Provider Status [${provider}:${effectiveModel || "default"}]`,
+        status.slice(-200),
+        "",
+        "success"
+      );
+    } catch (e: any) {
+      const msg = `Provider status error: ${String(e)}`;
+      setOutput(msg);
+      addTask(
+        `Provider Status [${provider}:${effectiveModel || "default"}]`,
+        "",
+        String(e),
+        "error"
+      );
+    }
+    setStatusChecking(false);
   };
 
   const handleRunProbe = async () => {
@@ -141,7 +231,7 @@ export default function AgentPanel() {
     <div className="agent-panel" style={{ padding: 16, height: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
       <h2 style={{ margin: 0 }}>🤖 AI Director</h2>
       <p style={{ color: "#888", fontSize: 13 }}>
-        Ask Qwen to pick tools, set parameters, and run scans. Results are interpreted and returned.
+        Toggle providers and model profiles like a mini model selector so you can A/B test agent behavior quickly.
       </p>
 
       {/* Work directory */}
@@ -153,6 +243,82 @@ export default function AgentPanel() {
           style={{ flex: 1, padding: "4px 8px", borderRadius: 4, border: "1px solid #333", background: "#1a1a2e", color: "#fff", fontSize: 12 }}
           placeholder="Path to cesarops-core/"
         />
+        <label style={{ color: "#888", fontSize: 12 }}>Provider:</label>
+        <select
+          value={provider}
+          onChange={(e) => setProvider(e.target.value as AgentProvider)}
+          style={{
+            minWidth: 160,
+            padding: "4px 8px",
+            borderRadius: 4,
+            border: "1px solid #333",
+            background: "#1a1a2e",
+            color: "#fff",
+            fontSize: 12,
+          }}
+        >
+          <option value="qwen">Qwen (DashScope)</option>
+          <option value="koboldcpp">KoboldCpp (local)</option>
+          <option value="github_sdk">GitHub SDK endpoint</option>
+        </select>
+        <button
+          onClick={handleProviderStatus}
+          disabled={running || statusChecking}
+          style={{
+            padding: "6px 10px",
+            borderRadius: 6,
+            border: "1px solid #333",
+            background: "#1a1a2e",
+            color: "#fff",
+            cursor: statusChecking ? "not-allowed" : "pointer",
+            fontSize: 11,
+            opacity: statusChecking ? 0.6 : 1,
+          }}
+        >
+          {statusChecking ? "Checking…" : "Provider Status"}
+        </button>
+      </div>
+
+      {/* Model profile selector */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <label style={{ color: "#888", fontSize: 12, minWidth: 62 }}>Agent:</label>
+        <select
+          value={modelPreset}
+          onChange={(e) => setModelPreset(e.target.value)}
+          style={{
+            minWidth: 280,
+            padding: "4px 8px",
+            borderRadius: 4,
+            border: "1px solid #333",
+            background: "#1a1a2e",
+            color: "#fff",
+            fontSize: 12,
+          }}
+        >
+          {PROVIDER_MODEL_PRESETS[provider].map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+          <option value="custom">Custom model id...</option>
+        </select>
+        {modelPreset === "custom" && (
+          <input
+            value={customModel}
+            onChange={(e) => setCustomModel(e.target.value)}
+            placeholder="Enter model id"
+            style={{
+              flex: 1,
+              padding: "4px 8px",
+              borderRadius: 4,
+              border: "1px solid #333",
+              background: "#1a1a2e",
+              color: "#fff",
+              fontSize: 12,
+            }}
+          />
+        )}
+        <span style={{ color: "#8b949e", fontSize: 11 }}>
+          Active: {effectiveModel || "default"}
+        </span>
       </div>
 
       {/* Request input + action buttons */}
