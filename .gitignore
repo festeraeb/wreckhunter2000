@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Secrets
+.env
+
+# Tauri
+tauri/node_modules/
+tauri/target/
+tauri/dist/
+tauri/src-tauri/target/
+tauri/src-tauri/gen/
+
+# Rust target
+cesarops-slicer/target/
+
+# IDE
+.vscode/settings.json
+
+# Outputs
+outputs/
+
+# Downloaded satellite data (large binary files, not for git)
+downloads/
+
+# Syncthing
+.stfolder/
+*.sync-conflict-*
+*.sync-template-*
+
+# Credentials
+cesarops.com.@Juliek01241973
+*Juliek*
+*cesarops.com.@*
