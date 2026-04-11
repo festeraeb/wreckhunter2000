@@ -1,12 +1,19 @@
 import os
+import shutil
 from pathlib import Path
 
 # Prioritized CUDA install dirs (recent first) - can be extended
 CUDA_CANDIDATES = [
+    # Windows
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2",
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0",
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2",
     r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8",
+    # Linux
+    "/usr/local/cuda",
+    "/usr/local/cuda-12.2",
+    "/usr/local/cuda-12.0",
+    "/usr/local/cuda-11.8",
 ]
 
 
@@ -22,6 +29,17 @@ def configure_cuda_environment():
             if Path(candidate).exists():
                 selected = candidate
                 break
+
+    # Linux fallback: nvcc in system PATH (e.g. /usr/bin/nvcc from nvidia-cuda-toolkit)
+    if selected is None and shutil.which("nvcc"):
+        nvcc_path = Path(shutil.which("nvcc")).resolve()
+        # nvcc is typically in <cuda>/bin/nvcc or /usr/bin/nvcc
+        cuda_bin_dir = nvcc_path.parent
+        if cuda_bin_dir.name == "bin" and cuda_bin_dir.parent.exists():
+            selected = str(cuda_bin_dir.parent)
+        else:
+            # nvcc in /usr/bin — use /usr as pseudo CUDA_PATH
+            selected = str(cuda_bin_dir.parent)
 
     if selected is None:
         raise FileNotFoundError(
