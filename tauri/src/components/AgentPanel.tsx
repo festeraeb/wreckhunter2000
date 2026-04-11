@@ -11,7 +11,7 @@ interface TaskEntry {
   status: string;
 }
 
-type AgentProvider = "qwen" | "koboldcpp" | "github_sdk";
+type AgentProvider = "qwen" | "koboldcpp" | "github_sdk" | "gemini" | "anthropic" | "groq";
 
 const PROVIDER_MODEL_PRESETS: Record<AgentProvider, Array<{ value: string; label: string }>> = {
   qwen: [
@@ -30,6 +30,22 @@ const PROVIDER_MODEL_PRESETS: Record<AgentProvider, Array<{ value: string; label
     { value: "gpt-4.1-mini", label: "GPT-4.1 Mini" },
     { value: "o4-mini", label: "o4-mini" },
   ],
+  gemini: [
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash (free)" },
+    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+    { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+  ],
+  anthropic: [
+    { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+    { value: "claude-haiku-4-20250514", label: "Claude Haiku 4 (fast)" },
+    { value: "claude-3-5-haiku-latest", label: "Claude 3.5 Haiku" },
+  ],
+  groq: [
+    { value: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (free, fast)" },
+    { value: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant (free)" },
+    { value: "mixtral-8x7b-32768", label: "Mixtral 8x7B (free)" },
+    { value: "gemma2-9b-it", label: "Gemma 2 9B (free)" },
+  ],
 };
 
 export default function AgentPanel() {
@@ -47,7 +63,7 @@ export default function AgentPanel() {
 
   useEffect(() => {
     const saved = localStorage.getItem("agent_provider");
-    if (saved === "qwen" || saved === "koboldcpp" || saved === "github_sdk") {
+    if (saved === "qwen" || saved === "koboldcpp" || saved === "github_sdk" || saved === "gemini" || saved === "anthropic" || saved === "groq") {
       setProvider(saved);
     }
 

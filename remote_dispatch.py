@@ -38,14 +38,14 @@ def _load_env(path: Path) -> dict:
 _dotenv = _load_env(Path(__file__).parent / ".env")
 
 # Pi (Janitor)
-PI_HOST = os.environ.get("PI_HOST", _dotenv.get("PI_HOST", "10.0.0.100"))
+PI_HOST = os.environ.get("PI_HOST", _dotenv.get("PI_HOST", "10.0.0.226"))
 PI_USER = os.environ.get("PI_USER", _dotenv.get("PI_USER", "pi"))
 PI_PASS = os.environ.get("PI_PASS", _dotenv.get("PI_PASS", ""))
 PI_KEY = os.environ.get("PI_KEY", _dotenv.get("PI_KEY", ""))
 PI_WORK = os.environ.get("PI_WORK", _dotenv.get("PI_WORK", "/home/pi/cesarops/sync"))
 
 # Xenon (Waifu)
-XENON_HOST = os.environ.get("XENON_HOST", _dotenv.get("XENON_HOST", "10.0.0.40"))
+XENON_HOST = os.environ.get("XENON_HOST", _dotenv.get("XENON_HOST", "10.0.0.55"))
 XENON_USER = os.environ.get("XENON_USER", _dotenv.get("XENON_USER", "cesarops"))
 XENON_PASS = os.environ.get("XENON_PASS", _dotenv.get("XENON_PASS", ""))
 XENON_KEY = os.environ.get("XENON_KEY", _dotenv.get("XENON_KEY", ""))

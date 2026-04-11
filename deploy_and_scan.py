@@ -18,8 +18,8 @@ NODES = {
         'password': 'admin',
         'work_dir': '/home/pi/cesarops',
     },
-    'xenon': {
-        'host': '10.0.0.40',
+    'xeon': {
+        'host': '10.0.0.55',
         'user': 'cesarops',
         'password': 'cesarops',
         'work_dir': '/home/cesarops/cesarops/cesarops-core',
@@ -98,86 +98,61 @@ def run_command(client, cmd, timeout=300):
         }
 
 def deploy_code():
-    """Deploy cesarops-core code to remote nodes."""
+    """Trigger pull-based update on each node via node_update.sh."""
     print("\n" + "="*60)
-    print("DEPLOYING CODE TO REMOTE NODES")
+    print("TRIGGERING PULL-BASED UPDATE ON REMOTE NODES")
     print("="*60)
-    
-    # Get list of Python files to deploy
+
+    # node_update.sh lives inside the repo; nodes run it from their local clone.
+    # If the script isn't on the node yet, SCP it once as a bootstrap step.
     core_dir = Path(__file__).parent
-    py_files = [
-        'ai_director.py',
-        'lake_michigan_scan.py',
-        'cesarops_orchestrator.py',
-        'hard_pixel_audit.py',
-        'swot_ssh_extractor.py',
-        'remote_dispatch.py',
-        'background_probe.py',
-        'cuda_env.py',
-        'cesarops_engine.py',
-        'database_connector.py',
-        'init_database.py',
-        'universal_downloader.py',
-    ]
-    
-    config_files = [
-        '.env',
-        'known_wrecks.json',
-        'satellite_data_sources.json',
-    ]
-    
+    update_script_local = core_dir / 'scripts' / 'node_update.sh'
+
     for node_name, node_cfg in NODES.items():
-        print(f"\n--- Deploying to {node_name} ({node_cfg['host']}) ---")
+        print(f"\n--- Updating {node_name} ({node_cfg['host']}) ---")
         client = ssh_connect(node_cfg)
         if not client:
-            print(f"  ✗ Could not connect to {node_name}")
+            print(f"  ✗ Could not connect to {node_name} — skipping")
             continue
-        
-        print(f"  ✓ Connected to {node_name}")
-        
-        # Create directories
-        result = run_command(client, f"mkdir -p {node_cfg['work_dir']}/outputs/probes")
-        print(f"  Created work directory: {'OK' if result['exit_code'] == 0 else 'FAILED'}")
-        
-        # Deploy each file using scp-like method (write via SSH)
-        for fname in py_files + config_files:
-            src = core_dir / fname
-            if not src.exists():
-                print(f"  Skipping {fname} (not found)")
-                continue
-            
-            content = src.read_text(encoding='utf-8')
-            dest = f"{node_cfg['work_dir']}/{fname}"
-            
-            # Write file via SSH
+
+        print(f"  ✓ Connected")
+
+        # ── Bootstrap: push node_update.sh if the repo clone doesn't exist yet ──
+        # Check whether the repo is already present on the node
+        check = run_command(client,
+            "find $HOME -maxdepth 6 -name 'node_update.sh' -path '*/scripts/*' 2>/dev/null | head -1")
+        script_path = check['stdout'].strip()
+
+        if not script_path:
+            print("  Repo not found on node — bootstrapping node_update.sh...")
             sftp = client.open_sftp()
             try:
-                sftp.put(str(src), dest)
-                print(f"  ✓ Deployed {fname}")
+                sftp.put(str(update_script_local), '/tmp/node_update_bootstrap.sh')
+                print("  ✓ Bootstrap script uploaded")
             except Exception as e:
-                print(f"  ✗ Failed to deploy {fname}: {e}")
+                print(f"  ✗ Could not upload bootstrap script: {e}")
+                client.close()
+                continue
             finally:
                 sftp.close()
-        
-        # Set up Python venv on Xenon if needed
-        if node_name == 'xenon':
-            print(f"\n  Setting up venv on Xenon...")
-            result = run_command(client, f"""
-                cd {node_cfg['work_dir']}
-                source ~/cesarops/venv/bin/activate 2>/dev/null || true
-                python3 -c "import cupy; print('CuPy version:', cupy.__version__)" 2>&1
-            """)
-            print(f"  CuPy check: {result['stdout'].strip() if result['stdout'] else result['stderr'].strip()}")
-            
-            # Install any missing packages
-            result = run_command(client, f"""
-                source ~/cesarops/venv/bin/activate
-                pip install --quiet cupy-cuda12x numpy rasterio simplekml pyproj scipy paramiko requests 2>&1 | tail -3
-            """, timeout=600)
-            print(f"  Package install: {result['stdout'].strip() if result['stdout'] else 'Already installed'}")
-        
+            script_path = '/tmp/node_update_bootstrap.sh'
+
+        # ── Run node_update.sh ───────────────────────────────────────────────
+        gpu_flag = '--gpu' if node_name == 'xenon' else ''
+        update_cmd = f"bash {script_path} {gpu_flag}".strip()
+        print(f"  Running: {update_cmd}")
+        result = run_command(client, update_cmd, timeout=300)
+
+        output = (result['stdout'] + result['stderr']).strip()
+        for line in output.splitlines():
+            print(f"    {line}")
+
+        if result['exit_code'] == 0:
+            print(f"  ✓ {node_name} updated successfully")
+        else:
+            print(f"  ✗ {node_name} update failed (exit {result['exit_code']})")
+
         client.close()
-        print(f"  ✓ Deployment complete for {node_name}")
 
 def run_comprehensive_scan():
     """Run the full multi-sensor scan on the defined area."""

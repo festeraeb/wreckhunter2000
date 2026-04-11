@@ -10,10 +10,10 @@ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-print("Connecting to 10.0.0.40:22...", flush=True)
+print("Connecting to 10.0.0.55:22...", flush=True)
 try:
     client.connect(
-        '10.0.0.40',
+        '10.0.0.55',
         port=22,
         username='cesarops',
         password='cesarops',

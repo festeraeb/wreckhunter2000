@@ -5,7 +5,7 @@ Your job is to fix the data pipeline, run the scans, and get real satellite data
 
 ## 🏗️ HARDWARE & PATHS
 - This Machine: Xenon (Ubuntu Linux)
-- IP: 10.0.0.40 | User: cesarops
+- IP: 10.0.0.55 | User: cesarops
 - GPU: Quadro P1000 (4GB VRAM). CUDA 12.0. CuPy 14.0.1.
 - Work Dir: /home/cesarops/cesarops/cesarops-core
 - VENV: source ~/cesarops/venv/bin/activate

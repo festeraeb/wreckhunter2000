@@ -42,40 +42,47 @@ fn resolve_core_dir() -> PathBuf {
     // Strategy 1: Walk up from cwd. Covers:
     //   dev:     tauri/ -> .. = cesarops-core/
     //   release: tauri/src-tauri/target/release/ -> ../../../../ = cesarops-core/
+    //   msi:     tauri/src-tauri/target/release/bundle/msi/ -> ../../../../../../ = cesarops-core/
     if let Ok(cwd) = std::env::current_dir() {
-        let up_paths = ["..", "../..", "../../..", "../../../..", "../../../../.."];
+        let up_paths = ["..", "../..", "../../..", "../../../..", "../../../../..", "../../../../../..", "../../../../../../.."];
         for rel in &up_paths {
             if let Some(dir) = cwd.join(rel).canonicalize().ok() {
                 if dir.join("ai_director.py").exists() {
+                    eprintln!("[resolve_core_dir] Strategy 1 (cwd walk-up '{}') → {}", rel, dir.display());
                     return dir;
                 }
             }
         }
+        eprintln!("[resolve_core_dir] Strategy 1 failed — cwd={}", cwd.display());
     }
 
-    // Strategy 2: Walk up from the running executable (up to 6 levels).
+    // Strategy 2: Walk up from the running executable (up to 8 levels).
     // Release binary sits at tauri/src-tauri/target/release/ — 4 levels deep.
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.clone();
-        for _ in 0..6 {
+        for i in 0..8 {
             dir = match dir.parent() {
                 Some(p) => p.to_path_buf(),
                 None => break,
             };
             if let Ok(canonical) = dir.canonicalize() {
                 if canonical.join("ai_director.py").exists() {
+                    eprintln!("[resolve_core_dir] Strategy 2 (exe walk-up level {}) → {}", i + 1, canonical.display());
                     return canonical;
                 }
             }
         }
+        eprintln!("[resolve_core_dir] Strategy 2 failed — exe={}", exe.display());
     }
 
     // Strategy 3: Check environment variable (set by user or installer)
     if let Ok(dir) = std::env::var("CESAROPS_CORE_DIR") {
         let p = PathBuf::from(&dir);
         if p.join("ai_director.py").exists() {
+            eprintln!("[resolve_core_dir] Strategy 3 (CESAROPS_CORE_DIR) → {}", p.display());
             return p;
         }
+        eprintln!("[resolve_core_dir] Strategy 3 failed — CESAROPS_CORE_DIR={}", dir);
     }
 
     // Strategy 4: Check common user development paths (both USERPROFILE and HOME)
@@ -83,8 +90,12 @@ fn resolve_core_dir() -> PathBuf {
     for var in &home_vars {
         if let Ok(home) = std::env::var(var) {
             let dev_paths = [
+                "programming\\wreckhunter2000-1",
+                "programming/wreckhunter2000-1",
                 "programming\\cesarops-core",
                 "programming/cesarops-core",
+                "Projects\\wreckhunter2000-1",
+                "Projects/wreckhunter2000-1",
                 "Projects\\cesarops-core",
                 "Projects/cesarops-core",
                 "Desktop\\cesarops-core",
@@ -93,19 +104,24 @@ fn resolve_core_dir() -> PathBuf {
             for sub in &dev_paths {
                 let candidate = PathBuf::from(&home).join(sub);
                 if candidate.join("ai_director.py").exists() {
+                    eprintln!("[resolve_core_dir] Strategy 4 ({}\\{}) → {}", var, sub, candidate.display());
                     return candidate;
                 }
                 if let Some(dir) = candidate.canonicalize().ok() {
                     if dir.join("ai_director.py").exists() {
+                        eprintln!("[resolve_core_dir] Strategy 4 canonical ({}\\{}) → {}", var, sub, dir.display());
                         return dir;
                     }
                 }
             }
+            eprintln!("[resolve_core_dir] Strategy 4 failed — {}={}", var, home);
         }
     }
 
     // Strategy 5: Fall back to current working directory
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    eprintln!("[resolve_core_dir] ALL STRATEGIES FAILED — falling back to cwd={}", fallback.display());
+    fallback
 }
 
 /// Resolve a user-provided work directory. If it's empty, relative (like ".."),
@@ -233,8 +249,35 @@ fn provider_runtime_config(
             let has_key = env_or_dotenv(&dotenv, "GITHUB_AGENT_API_KEY").is_some();
             Ok((base, model, has_key))
         }
+        "gemini" => {
+            let base = env_or_dotenv(&dotenv, "GEMINI_BASE_URL")
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta/openai".to_string());
+            let model = normalized_override.unwrap_or_else(|| {
+                env_or_dotenv(&dotenv, "GEMINI_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string())
+            });
+            let has_key = env_or_dotenv(&dotenv, "GEMINI_API_KEY").is_some();
+            Ok((base, model, has_key))
+        }
+        "anthropic" => {
+            let base = env_or_dotenv(&dotenv, "ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
+            let model = normalized_override.unwrap_or_else(|| {
+                env_or_dotenv(&dotenv, "ANTHROPIC_MODEL").unwrap_or_else(|| "claude-sonnet-4-20250514".to_string())
+            });
+            let has_key = env_or_dotenv(&dotenv, "ANTHROPIC_API_KEY").is_some();
+            Ok((base, model, has_key))
+        }
+        "groq" => {
+            let base = env_or_dotenv(&dotenv, "GROQ_BASE_URL")
+                .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string());
+            let model = normalized_override.unwrap_or_else(|| {
+                env_or_dotenv(&dotenv, "GROQ_MODEL").unwrap_or_else(|| "llama-3.3-70b-versatile".to_string())
+            });
+            let has_key = env_or_dotenv(&dotenv, "GROQ_API_KEY").is_some();
+            Ok((base, model, has_key))
+        }
         _ => Err(format!(
-            "Unknown provider '{}'. Expected one of: qwen, koboldcpp, github_sdk", provider
+            "Unknown provider '{}'. Expected one of: qwen, koboldcpp, github_sdk, gemini, anthropic, groq", provider
         )),
     }
 }
@@ -306,8 +349,32 @@ fn agent_provider_env(
                     "local".to_string()
                 });
         }
+        "gemini" => {
+            // Pass through — ai_director.py reads GEMINI_* vars natively
+            if has_key {
+                if let Some(k) = env_or_dotenv(&dotenv, "GEMINI_API_KEY") { env.insert("GEMINI_API_KEY".to_string(), k); }
+            }
+            env.insert("GEMINI_BASE_URL".to_string(), base);
+            env.insert("GEMINI_MODEL".to_string(), model);
+        }
+        "anthropic" => {
+            // Pass through — ai_director.py reads ANTHROPIC_* vars natively
+            if has_key {
+                if let Some(k) = env_or_dotenv(&dotenv, "ANTHROPIC_API_KEY") { env.insert("ANTHROPIC_API_KEY".to_string(), k); }
+            }
+            env.insert("ANTHROPIC_BASE_URL".to_string(), base);
+            env.insert("ANTHROPIC_MODEL".to_string(), model);
+        }
+        "groq" => {
+            // Pass through — ai_director.py reads GROQ_* vars natively
+            if has_key {
+                if let Some(k) = env_or_dotenv(&dotenv, "GROQ_API_KEY") { env.insert("GROQ_API_KEY".to_string(), k); }
+            }
+            env.insert("GROQ_BASE_URL".to_string(), base);
+            env.insert("GROQ_MODEL".to_string(), model);
+        }
         _ => return Err(format!(
-            "Unknown provider '{}'. Expected one of: qwen, koboldcpp, github_sdk", provider
+            "Unknown provider '{}'. Expected one of: qwen, koboldcpp, github_sdk, gemini, anthropic, groq", provider
         )),
     }
     Ok(env)
@@ -359,24 +426,35 @@ async fn run_python_task(
         resolve_work_dir(raw).to_string_lossy().to_string()
     };
 
+    // Build absolute path to the script — avoids CWD-relative resolution issues
+    let script_abs = {
+        let p = PathBuf::from(&work_dir).join(&script);
+        if p.exists() {
+            p.to_string_lossy().to_string()
+        } else {
+            eprintln!("[run_python_task] script not found at {}, falling back to name '{}'", p.display(), script);
+            script.clone()
+        }
+    };
+
     let mut cmd = Command::new(python);
     cmd.current_dir(&work_dir);
     cmd.env("PYTHONIOENCODING", "utf-8");
     if let Some(env_vars) = extra_env {
         for (k, v) in env_vars { cmd.env(k, v); }
     }
-    cmd.arg(&script);
+    cmd.arg(&script_abs);
     cmd.args(&args);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {} (cwd={})", script, e, work_dir))?;
+        .map_err(|e| format!("Failed to spawn '{}': {} (cwd={}, script_abs={})", script, e, work_dir, script_abs))?;
 
     app.emit("task_started", &TaskOutput {
         id: task_id.clone(),
         status: "running".into(),
-        stdout: format!("Spawned: {} {}\nWorking dir: {}\n---\n", python, script, work_dir),
+        stdout: format!("Spawned: {} {}\nWorking dir: {}\n---\n", python, script_abs, work_dir),
         stderr: String::new(),
         duration_s: 0.0,
     }).ok();
@@ -450,17 +528,48 @@ async fn ai_direct_request(
 ) -> Result<TaskOutput, String> {
     let actual_work_dir = resolve_work_dir(&work_dir);
     let selected_provider = provider.as_deref().unwrap_or("qwen");
-    let extra_env = agent_provider_env(
+
+    // If the selected provider endpoint is down, fall back to qwen so AI Director
+    // still runs instead of failing hard on localhost-only provider outages.
+    let effective_provider = match provider_runtime_config(
         selected_provider,
         &actual_work_dir,
         model_override.as_deref(),
+    ) {
+        Ok((base, _, _)) if tcp_reachable(&base) => selected_provider,
+        Ok((base, _, _)) => {
+            eprintln!(
+                "[ai_direct_request] Provider '{}' endpoint unreachable at {}. Trying fallback to 'qwen'.",
+                selected_provider,
+                base
+            );
+            match provider_runtime_config("qwen", &actual_work_dir, model_override.as_deref()) {
+                Ok((qwen_base, _, _)) if tcp_reachable(&qwen_base) => "qwen",
+                _ => selected_provider,
+            }
+        }
+        Err(_) => selected_provider,
+    };
+
+    let extra_env = agent_provider_env(
+        effective_provider,
+        &actual_work_dir,
+        model_override.as_deref(),
     ).ok();
+
+    let mut args = vec!["--request".to_string(), request, "--execute".to_string()];
+    // Tell ai_director.py which provider to prefer
+    if effective_provider != "qwen" && effective_provider != "koboldcpp" && effective_provider != "github_sdk" {
+        // Native providers: gemini, anthropic, groq — pass directly
+        args.push("--provider".to_string());
+        args.push(effective_provider.to_string());
+    }
 
     run_python_task(
         app,
         "ai_direct".into(),
         "ai_director.py".into(),
-        vec!["--request".into(), request, "--execute".into()],
+        args,
         Some(actual_work_dir.to_string_lossy().to_string()),
         extra_env,
     ).await

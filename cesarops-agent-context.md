@@ -11,7 +11,7 @@ Your goal is to orchestrate satellite data downloads, run GPU-accelerated anomal
 
 * **Laptop (Windows):** Code repository, Orchestrator, Tauri Frontend.
 * **Pi (Raspberry Pi / 10.0.0.226):** Data acquisition engine. Downloads raw data via `universal_downloader.py`.
-* **Xenon (Ubuntu / 10.0.0.40):** The Workhorse. Runs the GPU (Quadro P1000) processing and scan analysis.
+* **Xeon (Ubuntu / 10.0.0.55):** The Workhorse. Runs the GPU (Quadro P1000) processing and scan analysis.
   * **Work Dir:** `/home/cesarops/cesarops/cesarops-core` (or `/home/cesarops/cesarops-core` - check filesystem!)
   * **GPU:** Quadro P1000 (4GB VRAM). Use CuPy for z-score/thresholding.
   * **CPU:** 8-Core Optiplex.
@@ -92,7 +92,7 @@ Your goal is to orchestrate satellite data downloads, run GPU-accelerated anomal
 * **Earthdata:** `cesarops.com.@` / `Juliek01241973`.
 * **SSH:**
   * Pi: `pi` / `admin` (10.0.0.226)
-  * Xenon: `cesarops` / `cesarops` (10.0.0.40)
+  * Xeon: `cesarops` / `cesarops` (10.0.0.55)
 
 ---
 
@@ -128,7 +128,7 @@ Your goal is to orchestrate satellite data downloads, run GPU-accelerated anomal
 
 ## 🔧 TPU / Processing Notes
 
-* TPU server runs on Xenon at `http://10.0.0.40:5001`
+* TPU server runs on Xeon at `http://10.0.0.55:5001`
 
 * `remote_dispatch.py` status() will **auto-start tpu_server.py** via SSH if unreachable
 * If TPU still offline: pass `--no-llm` to ai_director.py and use keyword matching

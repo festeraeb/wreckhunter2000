@@ -55,6 +55,24 @@ QWEN_MODEL = os.environ.get("QWEN_MODEL", _dotenv.get("QWEN_MODEL", "qwen-plus")
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", _dotenv.get("QWEN_BASE_URL",
     "https://dashscope.aliyuncs.com/compatible-mode/v1"))
 
+# Gemini (Google AI Studio — free tier: gemini-2.5-flash)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", _dotenv.get("GEMINI_API_KEY", ""))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", _dotenv.get("GEMINI_MODEL", "gemini-2.5-flash"))
+GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", _dotenv.get("GEMINI_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta/openai"))
+
+# Anthropic Claude (sonnet/haiku — free tier via API key)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", _dotenv.get("ANTHROPIC_API_KEY", ""))
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", _dotenv.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"))
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", _dotenv.get("ANTHROPIC_BASE_URL",
+    "https://api.anthropic.com/v1"))
+
+# Groq Cloud (LPU — free tier: llama-3.3-70b-versatile)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", _dotenv.get("GROQ_API_KEY", ""))
+GROQ_MODEL = os.environ.get("GROQ_MODEL", _dotenv.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", _dotenv.get("GROQ_BASE_URL",
+    "https://api.groq.com/openai/v1"))
+
 # ── API Key Setup Helper ─────────────────────────────────────────────────────
 
 def check_and_prompt_api_keys() -> Dict[str, str]:
@@ -428,15 +446,149 @@ def call_qwen(messages: List[Dict]) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def parse_with_qwen(user_request: str) -> Dict:
-    """Use Qwen to parse a natural language request into tool config."""
+def call_gemini(messages: List[Dict]) -> str:
+    """Send messages to Google Gemini via OpenAI-compatible API."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set. Get one at https://aistudio.google.com/apikey")
+
+    url = f"{GEMINI_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": GEMINI_MODEL,
+        "messages": messages,
+        "temperature": 0.3,
+    }
+
+    resp = requests.post(url, headers=headers, json=body, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def call_anthropic(messages: List[Dict]) -> str:
+    """Send messages to Anthropic Claude via the Messages API."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not set. Get one at https://console.anthropic.com/")
+
+    url = f"{ANTHROPIC_BASE_URL}/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    # Convert OpenAI-style messages to Anthropic format
+    system_text = ""
+    user_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_text += m["content"] + "\n"
+        else:
+            user_messages.append({"role": m["role"], "content": m["content"]})
+    if not user_messages:
+        user_messages = [{"role": "user", "content": "Hello"}]
+
+    body = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 4096,
+        "temperature": 0.3,
+        "messages": user_messages,
+    }
+    if system_text.strip():
+        body["system"] = system_text.strip()
+
+    resp = requests.post(url, headers=headers, json=body, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    # Anthropic returns content as a list of blocks
+    blocks = data.get("content", [])
+    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+
+def call_groq(messages: List[Dict]) -> str:
+    """Send messages to Groq Cloud via OpenAI-compatible API (LPU fast inference)."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set. Get one at https://console.groq.com/keys")
+
+    url = f"{GROQ_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.3,
+    }
+
+    resp = requests.post(url, headers=headers, json=body, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+# ── Multi-provider dispatch ───────────────────────────────────────────────────
+
+# Provider registry: name -> (key_var, call_function)
+PROVIDER_REGISTRY = {
+    "qwen":      lambda: (QWEN_API_KEY,      call_qwen),
+    "gemini":    lambda: (GEMINI_API_KEY,     call_gemini),
+    "anthropic": lambda: (ANTHROPIC_API_KEY,  call_anthropic),
+    "groq":      lambda: (GROQ_API_KEY,       call_groq),
+}
+
+# Fallback order when primary provider fails
+PROVIDER_FALLBACK_ORDER = ["qwen", "gemini", "groq", "anthropic"]
+
+
+def call_llm(messages: List[Dict], preferred_provider: str = None) -> str:
+    """
+    Call an LLM provider with automatic fallback.
+    Tries preferred_provider first, then falls through the fallback chain.
+    """
+    # Build try-order: preferred first, then remaining from fallback list
+    order = []
+    if preferred_provider and preferred_provider in PROVIDER_REGISTRY:
+        order.append(preferred_provider)
+    for p in PROVIDER_FALLBACK_ORDER:
+        if p not in order:
+            order.append(p)
+
+    last_error = None
+    for provider_name in order:
+        key, call_fn = PROVIDER_REGISTRY[provider_name]()
+        if not key:
+            continue  # skip providers without API keys
+        try:
+            result = call_fn(messages)
+            if result:
+                if provider_name != order[0]:
+                    print(f"  [LLM] Used fallback provider: {provider_name}")
+                return result
+        except Exception as e:
+            last_error = e
+            print(f"  [LLM] {provider_name} failed: {e}")
+            continue
+
+    if last_error:
+        raise RuntimeError(f"All LLM providers failed. Last error: {last_error}")
+    raise RuntimeError(
+        "No LLM provider configured. Set at least one API key in .env:\n"
+        "  QWEN_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY"
+    )
+
+
+def parse_with_qwen(user_request: str, provider: str = None) -> Dict:
+    """Use an LLM to parse a natural language request into tool config."""
     system = _build_system_prompt()
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_request},
     ]
 
-    raw = call_qwen(messages)
+    raw = call_llm(messages, preferred_provider=provider)
 
     # Extract JSON from response (strip markdown code blocks if present)
     raw = raw.strip()
@@ -451,8 +603,8 @@ def parse_with_qwen(user_request: str) -> Dict:
     return parsed
 
 
-def interpret_results_with_qwen(results: List[Dict], config: Dict) -> str:
-    """Send tool execution results to Qwen for interpretation and next steps."""
+def interpret_results_with_qwen(results: List[Dict], config: Dict, provider: str = None) -> str:
+    """Send tool execution results to an LLM for interpretation and next steps."""
     # Build a concise summary of results
     summary_parts = []
     for r in results:
@@ -464,7 +616,7 @@ def interpret_results_with_qwen(results: List[Dict], config: Dict) -> str:
         if r.get('stdout'):
             for line in r['stdout'].split('\n'):
                 if any(kw in line.lower() for kw in ['detection', 'anomalies', 'lock', 'complete', 'total', 'fused']):
-                    summary_parts.append(f"  → {line.strip()}")
+                    summary_parts.append(f"  -> {line.strip()}")
 
     summary = "\n".join(summary_parts)
 
@@ -474,7 +626,7 @@ def interpret_results_with_qwen(results: List[Dict], config: Dict) -> str:
             "Review the CESAROPS sensor probe results below and provide:\n"
             "1. A brief executive summary of what was found\n"
             "2. Key anomalies worth investigating\n"
-            "3. Recommended next steps — ONLY parameter adjustments on existing tools "
+            "3. Recommended next steps -- ONLY parameter adjustments on existing tools "
             "(e.g., 'raise thermal_zscore to 3.0', 'narrow bbox to ...', 'add SAR sensor'). "
             "Do NOT suggest writing new code or new tools without explicit human approval.\n"
             "4. Confidence assessment of any detected targets\n"
@@ -489,17 +641,18 @@ def interpret_results_with_qwen(results: List[Dict], config: Dict) -> str:
         )},
     ]
 
-    return call_qwen(messages)
+    return call_llm(messages, preferred_provider=provider)
 
 
 # ── AI Director class ────────────────────────────────────────────────────────
 
 class AIDirector:
-    """AI Director — Qwen-powered tool picker, executor, and interpreter."""
+    """AI Director — multi-provider LLM-powered tool picker, executor, and interpreter."""
 
-    def __init__(self, use_llm: bool = True):
+    def __init__(self, use_llm: bool = True, provider: str = None):
         self.results = []
         self.use_llm = use_llm
+        self.provider = provider  # preferred LLM provider (None = auto-fallback)
         self.config = {
             'bbox': None,
             'tools': [],
@@ -509,16 +662,17 @@ class AIDirector:
 
     def parse_request(self, request: str) -> Dict:
         """Parse natural language request into tool config."""
-        if self.use_llm and QWEN_API_KEY:
+        if self.use_llm and any([QWEN_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY]):
             try:
-                print("  🤖 Calling Qwen LLM for tool selection...")
-                parsed = parse_with_qwen(request)
+                provider_label = self.provider or "auto"
+                print(f"  [LLM] Calling provider '{provider_label}' for tool selection...")
+                parsed = parse_with_qwen(request, provider=self.provider)
                 reasoning = parsed.pop('reasoning', '')
                 if reasoning:
-                    print(f"  💡 Qwen reasoning: {reasoning}")
+                    print(f"  [LLM] Reasoning: {reasoning}")
                 return parsed
             except Exception as e:
-                print(f"  ⚠ Qwen LLM failed ({e}), falling back to keyword matching")
+                print(f"  [LLM] All providers failed ({e}), falling back to keyword matching")
 
         # Keyword matching fallback
         request_lower = request.lower()
@@ -782,17 +936,19 @@ class AIDirector:
     # ── Interpretation ─────────────────────────────────────────────────────
 
     def interpret(self) -> str:
-        """Send results to Qwen for interpretation."""
-        if not QWEN_API_KEY:
-            print("  ⚠ QWEN_API_KEY not set, skipping interpretation")
+        """Send results to LLM for interpretation."""
+        has_any_key = any([QWEN_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY])
+        if not has_any_key:
+            print("  [LLM] No API keys set, skipping interpretation")
             return self.summarize()
 
         try:
-            print("\n  🤖 Sending results to Qwen for interpretation...")
-            briefing = interpret_results_with_qwen(self.results, self.config)
+            provider_label = self.provider or "auto"
+            print(f"\n  [LLM] Sending results to '{provider_label}' for interpretation...")
+            briefing = interpret_results_with_qwen(self.results, self.config, provider=self.provider)
             return briefing
         except Exception as e:
-            print(f"  ⚠ Interpretation failed: {e}")
+            print(f"  [LLM] Interpretation failed: {e}")
             return self.summarize()
 
 
@@ -809,7 +965,10 @@ def main():
     parser.add_argument('--execute-plan', action='store_true', help='Step 2: Execute a saved plan (No LLM timeout).')
     parser.add_argument('--execute', '-x', action='store_true')
     parser.add_argument('--interpret', '-i', type=str, nargs='*', help='Step 3: Interpret existing results.')
-    parser.add_argument('--no-llm', action='store_true', help='Disable Qwen, use keyword matching')
+    parser.add_argument('--no-llm', action='store_true', help='Disable LLM, use keyword matching')
+    parser.add_argument('--provider', '-p', type=str,
+                        choices=['qwen', 'gemini', 'anthropic', 'groq'],
+                        help='Preferred LLM provider (default: auto-fallback)')
     parser.add_argument('--output', '-o', type=str, help='Save results to JSON')
     parser.add_argument('--setup-keys', action='store_true', help='Interactively configure API keys')
     parser.add_argument('--data-sources', action='store_true', help='List available satellite data sources')
@@ -843,10 +1002,10 @@ def main():
             print("satellite_data_sources.json not found")
         return
 
-    if not QWEN_API_KEY:
-        print("⚠ QWEN_API_KEY not set — LLM features disabled")
+    if not any([QWEN_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY]):
+        print("-- No LLM API keys set -- keyword matching only")
         print("  Run: python ai_director.py --setup-keys")
-        print("  Or set in .env: QWEN_API_KEY=sk-...")
+        print("  Or set in .env: QWEN_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY")
 
     # ── Interpret mode ─────────────────────────────────────────────────────
     if args.interpret is not None:
@@ -858,7 +1017,7 @@ def main():
             else:
                 print(f"  ⚠ Not found: {fp}")
 
-        if results_data and QWEN_API_KEY:
+        if results_data and any([QWEN_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY]):
             messages = [
                 {"role": "system", "content": (
                     "You are a Great Lakes wreck detection analyst AI. "
@@ -870,9 +1029,9 @@ def main():
                 )},
                 {"role": "user", "content": json.dumps(results_data, indent=2)[:4000]},
             ]
-            print(call_qwen(messages))
+            print(call_llm(messages, preferred_provider=getattr(args, 'provider', None)))
         elif results_data:
-            print("  ⚠ QWEN_API_KEY not set, cannot interpret")
+            print("  No LLM API keys set, cannot interpret")
         return
 
     # ── List tools ─────────────────────────────────────────────────────────
@@ -890,7 +1049,7 @@ def main():
     # ── PLAN MODE (LLM takes its time to think) ────────────────────────────
     if args.plan and args.request:
         print(f"\nRequest: {args.request}")
-        director = AIDirector(use_llm=not args.no_llm)
+        director = AIDirector(use_llm=not args.no_llm, provider=getattr(args, 'provider', None))
         plan = director.parse_request(args.request)
         
         plan_path = Path(__file__).parent / "outputs" / "current_plan.json"
@@ -939,7 +1098,7 @@ def main():
         return
 
     # ── Run ────────────────────────────────────────────────────────────────
-    director = AIDirector(use_llm=not args.no_llm)
+    director = AIDirector(use_llm=not args.no_llm, provider=getattr(args, 'provider', None))
 
     if args.request:
         print(f"\nRequest: {args.request}")

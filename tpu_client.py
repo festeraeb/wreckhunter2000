@@ -10,17 +10,17 @@ from io import BytesIO
 from PIL import Image
 from pathlib import Path
 
-XENON_TPU_URL  = "http://10.0.0.40:5001"
+XEON_TPU_URL   = "http://10.0.0.55:5001"
 LOCAL_TPU_URL  = "http://localhost:5001"
-_FALLBACK_URLS = [XENON_TPU_URL, LOCAL_TPU_URL]
+_FALLBACK_URLS = [XEON_TPU_URL, LOCAL_TPU_URL]
 
 
-def create_tpu_client(prefer_xenon: bool = True) -> "TPUClient":
+def create_tpu_client(prefer_xeon: bool = True) -> "TPUClient":
     """
     Return a TPUClient connected to the first reachable TPU server.
-    Order: Xenon (10.0.0.40:5001) → localhost:5001 → CPU stub.
+    Order: Xeon (10.0.0.55:5001) -> localhost:5001 -> CPU stub.
     """
-    urls = _FALLBACK_URLS if prefer_xenon else list(reversed(_FALLBACK_URLS))
+    urls = _FALLBACK_URLS if prefer_xeon else list(reversed(_FALLBACK_URLS))
     for url in urls:
         client = TPUClient(url)
         h = client.health_check()

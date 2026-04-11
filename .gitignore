@@ -21,6 +21,7 @@ tauri/src-tauri/gen/
 
 # Rust target
 cesarops-slicer/target/
+sentinel_hunt_src/target/
 
 # IDE
 .vscode/settings.json
