@@ -42,10 +42,13 @@ def configure_cuda_environment():
             selected = str(cuda_bin_dir.parent)
 
     if selected is None:
-        raise FileNotFoundError(
-            'CUDA toolkit not found. Set CUDA_PATH to a valid CUDA installation directory ' 
-            'or install CUDA 13.2/13.0/12.2/11.8.'
+        import warnings
+        warnings.warn(
+            'CUDA toolkit not found — running in CPU-only mode. '
+            'Set CUDA_PATH or install CUDA 12.2/11.8 to enable GPU acceleration.',
+            RuntimeWarning
         )
+        return {'cuda_path': None, 'cuda_bin': None}
 
     cuda_bin = str(Path(selected) / 'bin')
     os.environ['CUDA_PATH'] = selected

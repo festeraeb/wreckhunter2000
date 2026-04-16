@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Deploy code to remote nodes and run a comprehensive multi-sensor scan.
-Uses paramiko for SSH with password authentication.
+Uses paramiko for SSH with key-based auth (falls back to .env passwords).
 """
 
 import paramiko
@@ -10,19 +10,32 @@ import os
 import json
 from pathlib import Path
 
-# Node configurations
+
+def _load_env(path: Path) -> dict:
+    env = {}
+    if path.exists():
+        for line in path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, _, v = line.partition('=')
+                env[k.strip()] = v.strip()
+    return env
+
+_dotenv = _load_env(Path(__file__).parent / ".env")
+
+# Node configurations — credentials from environment / .env, never hardcoded
 NODES = {
     'pi': {
-        'host': '10.0.0.226',
-        'user': 'pi',
-        'password': 'admin',
+        'host': os.environ.get("PI_HOST", _dotenv.get("PI_HOST", "10.0.0.226")),
+        'user': os.environ.get("PI_USER", _dotenv.get("PI_USER", "pi")),
+        'password': os.environ.get("PI_PASS", _dotenv.get("PI_PASS", "")),
         'work_dir': '/home/pi/cesarops',
     },
     'xeon': {
-        'host': '10.0.0.55',
-        'user': 'cesarops',
-        'password': 'cesarops',
-        'work_dir': '/home/cesarops/cesarops/cesarops-core',
+        'host': os.environ.get("XENON_HOST", _dotenv.get("XENON_HOST", "10.0.0.129")),  # cesarops2 at .129
+        'user': os.environ.get("XENON_USER", _dotenv.get("XENON_USER", "cesarops1")),
+        'password': os.environ.get("XENON_PASS", _dotenv.get("XENON_PASS", "cesarops1")),
+        'work_dir': '/home/cesarops1/wreckhunter2000-1',
     }
 }
 
@@ -44,26 +57,37 @@ SCAN_AREA = {
 }
 
 def ssh_connect(node_config):
-    """Connect to a node with password auth, trying multiple methods."""
+    """Connect to a node with key-based auth, falling back to password from .env."""
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    
+    # Load known hosts to prevent MITM — reject unknown hosts
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
     try:
-        # Try key-based auth first
+        client.load_system_host_keys()
+    except FileNotFoundError:
+        pass
+
+    try:
+        # Try key-based auth first (ed25519 keys deployed via SSH)
         client.connect(
             node_config['host'],
             username=node_config['user'],
-            password=node_config['password'],
             timeout=10,
             allow_agent=True,
             look_for_keys=True,
         )
         return client
     except Exception as e:
-        print(f"  Key auth failed ({e}), trying password-only...")
+        if not node_config.get('password'):
+            print(f"  Key auth failed and no password configured: {e}")
+            return None
+        print(f"  Key auth failed ({e}), trying password from .env...")
         try:
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            try:
+                client.load_system_host_keys()
+            except FileNotFoundError:
+                pass
             client.connect(
                 node_config['host'],
                 username=node_config['user'],
@@ -71,7 +95,6 @@ def ssh_connect(node_config):
                 timeout=10,
                 allow_agent=False,
                 look_for_keys=False,
-                disabled_algorithms={'pubkey_types': ['rsa-sha2-256', 'rsa-sha2-512']},
             )
             return client
         except Exception as e2:
