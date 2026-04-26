@@ -1,0 +1,31 @@
+[package]
+name = "sovereign-cloud"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.43", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+wgpu = "29.0"
+nvml-wrapper = "0.12"
+mdns-sd = "0.13"
+uuid = { version = "1.8", features = ["v4"] }
+nauticuvs = { path = "../nauticuvs" }
+pollster = "0.4"
+hostname = "0.3"
+sled = "0.34"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "sysinfoapi"] }
+
+[features]
+default = []
