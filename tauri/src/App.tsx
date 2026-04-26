@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { Wreck, ActivePanel, MagPotential } from "./types";
 import WreckList from "./components/WreckList";
 import WreckDetail from "./components/WreckDetail";
+import { PasswordGate } from "./components/PasswordGate";
 
 import StatsPanel from "./components/StatsPanel";
 import ScanPanel from "./components/ScanPanel";
@@ -9,6 +10,7 @@ import MagPipelinePanel from "./components/MagPipelinePanel";
 import EriePanel from "./components/EriePanel";
 import RestorationPanel from "./components/RestorationPanel";
 import MapPanel from "./components/MapPanel";
+import { EarthMonitorPanel } from "./components/EarthMonitorPanel";
 import PDFBreakerPanel from "./components/PDFBreakerPanel";
 import ExportPanel from "./components/ExportPanel";
 import AgentPanel from "./components/AgentPanel";
@@ -16,12 +18,19 @@ import MissionControlPanel from "./components/MissionControlPanel";
 import LoranPanel from "./components/LoranPanel";
 import ExtendedSensorsPanel from "./components/ExtendedSensorsPanel";
 import HarvesterPanel from "./components/HarvesterPanel";
+import SatelliteTrackerPanel from "./components/SatelliteTrackerPanel";
 import AutoBagPrompt from "./components/AutoBagPrompt";
 import UpdateChecker from "./components/UpdateChecker";
+import WorkerStatusPanel from "./components/WorkerStatusPanel";
 import { getApiBase, resetConnectionState } from "./services/api";
 import "./styles/global.css";
 
+// Panels accessible without authentication
+const PUBLIC_PANELS: ActivePanel[] = ["stats", "list", "map", "satellite", "detail"];
+
 export default function App() {
+  const [unlocked, setUnlocked] = useState(false);
+  const [showGate, setShowGate] = useState(false);
   const [panel, setPanel] = useState<ActivePanel>("stats");
   const [selectedWreck, setSelectedWreck] = useState<Wreck | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -69,12 +78,20 @@ export default function App() {
     setPanel("list");
   };
 
-  const handleSetPanel = (panel: ActivePanel) => {
-    setPanel(panel);
+  /** Navigate to a panel — prompt for password if it's protected and not yet unlocked */
+  const handleSetPanel = (target: ActivePanel) => {
+    if (!unlocked && !PUBLIC_PANELS.includes(target)) {
+      setShowGate(true);
+      return;
+    }
+    setPanel(target);
   };
 
   return (
     <div className="app-shell">
+      {showGate && (
+        <PasswordGate onUnlock={() => { setUnlocked(true); setShowGate(false); }} />
+      )}
       <AutoBagPrompt />
       <UpdateChecker />
       {/* ── Top bar ────────────────────────────────────── */}
@@ -122,6 +139,9 @@ export default function App() {
         <button className={panel === "map" ? "active" : ""} onClick={() => setPanel("map")}>
           🗺 Map
         </button>
+        <button className={panel === "earth" ? "active" : ""} onClick={() => handleSetPanel("earth")}>
+          🌍 Earth Monitor
+        </button>
 
         {selectedWreck && (
           <button className={panel === "detail" ? "active" : ""} onClick={() => setPanel("detail")}>
@@ -143,43 +163,72 @@ export default function App() {
           〰 Moderate Magnetic
         </button>
 
-        <div className="section-label">Agent</div>
-        <button className={panel === "agent" ? "active" : ""} onClick={() => setPanel("agent")}>
+        <div className="section-label">
+          {unlocked ? "Agent 🔓" : "Agent 🔒"}
+        </div>
+        <button className={panel === "agent" ? "active" : ""} onClick={() => handleSetPanel("agent")}>
           🤖 AI Director
         </button>
+        <button className={panel === "workers" ? "active" : ""} onClick={() => handleSetPanel("workers")}>
+          ⚙️ Node Status
+        </button>
 
-        <div className="section-label">Pipelines</div>
-        <button className={panel === "scan" ? "active" : ""} onClick={() => setPanel("scan")}>
+        <div className="section-label">
+          {unlocked ? "Pipelines 🔓" : "Pipelines 🔒"}
+        </div>
+        <button className={panel === "scan" ? "active" : ""} onClick={() => handleSetPanel("scan")}>
           📡 Scanner & Restoration
         </button>
-        <button className={panel === "mag" ? "active" : ""} onClick={() => setPanel("mag")}>
+        <button className={panel === "mag" ? "active" : ""} onClick={() => handleSetPanel("mag")}>
           🧲 Mag Pipeline
         </button>
-        <button className={panel === "erie" ? "active" : ""} onClick={() => setPanel("erie")}>
+        <button className={panel === "erie" ? "active" : ""} onClick={() => handleSetPanel("erie")}>
           🌊 Lake Erie Scanner
         </button>
-        <button className={panel === "mission" ? "active" : ""} onClick={() => setPanel("mission")}>
+        <button className={panel === "mission" ? "active" : ""} onClick={() => handleSetPanel("mission")}>
           🎯 Mission Control
         </button>
-        <button className={panel === "pdf" ? "active" : ""} onClick={() => setPanel("pdf")}>
+        <button className={panel === "pdf" ? "active" : ""} onClick={() => handleSetPanel("pdf")}>
           📄 PDF Redactor
         </button>
 
         <div className="section-label">Analysis</div>
-        <button className={panel === "loran" ? "active" : ""} onClick={() => setPanel("loran")}>
+        <button className={panel === "satellite" ? "active" : ""} onClick={() => setPanel("satellite")}>
+          🛰 Satellite Tracker
+        </button>
+        <button className={panel === "loran" ? "active" : ""} onClick={() => handleSetPanel("loran")}>
           🌍 Loran-C Warp
         </button>
-        <button className={panel === "sensors" ? "active" : ""} onClick={() => setPanel("sensors")}>
+        <button className={panel === "sensors" ? "active" : ""} onClick={() => handleSetPanel("sensors")}>
           🛰 Extended Sensors
         </button>
         <button className={panel === "harvest" ? "active" : ""} onClick={() => handleSetPanel("harvest")}>
           🪝 Raw Harvester
         </button>
 
-        <div className="section-label">Export</div>
-        <button className={panel === "export" ? "active" : ""} onClick={() => setPanel("export")}>
+        <div className="section-label">
+          {unlocked ? "Export 🔓" : "Export 🔒"}
+        </div>
+        <button className={panel === "export" ? "active" : ""} onClick={() => handleSetPanel("export")}>
           📤 KML / KMZ Export
         </button>
+
+        {!unlocked && (
+          <button
+            onClick={() => setShowGate(true)}
+            style={{ marginTop: "0.8rem", opacity: 0.7, fontSize: "0.8rem" }}
+          >
+            🔐 Unlock Full Access
+          </button>
+        )}
+        {unlocked && (
+          <button
+            onClick={() => { setUnlocked(false); sessionStorage.removeItem("wh2k_unlocked"); }}
+            style={{ marginTop: "0.8rem", opacity: 0.6, fontSize: "0.8rem" }}
+          >
+            🔒 Lock
+          </button>
+        )}
       </div>
 
       {/* ── Main content ───────────────────────────────── */}
@@ -199,7 +248,13 @@ export default function App() {
         <div style={{ display: panel === "map" ? "block" : "none", height: '100%' }}>
           <MapPanel onSelect={handleSelect} />
         </div>
+        <div style={{ display: panel === "earth" ? "block" : "none", height: '100%' }}>
+          <EarthMonitorPanel />
+        </div>
 
+        <div style={{ display: panel === "workers" ? "block" : "none", height: '100%' }}>
+          <WorkerStatusPanel />
+        </div>
         <div style={{ display: panel === "scan" ? "block" : "none", height: '100%' }}>
           <ScanPanel />
         </div>
@@ -226,6 +281,9 @@ export default function App() {
         </div>
         <div style={{ display: panel === "harvest" ? "block" : "none", height: '100%' }}>
           <HarvesterPanel />
+        </div>
+        <div style={{ display: panel === "satellite" ? "block" : "none", height: '100%' }}>
+          <SatelliteTrackerPanel />
         </div>
         <div style={{ display: panel === "agent" ? "block" : "none", height: '100%' }}>
           <AgentPanel />
