@@ -18,7 +18,15 @@ import sqlite3
 from typing import Optional
 from pathlib import Path
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 import sys
+import subprocess
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 # â”€â”€ Inject pipeline source directories so lazy `from X import Y` calls work â”€â”€
 # Repo root = two levels up from wrecks_api/app.py
@@ -29,7 +37,7 @@ for _sub in ("pipelines/mag", "pipelines/satellite", "pipelines/bag",
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
 from pydantic import BaseModel
@@ -62,6 +70,11 @@ def _advanced_scan_worker(queue, paths: list, output_dir: str, config: dict):
 _HERE = Path(__file__).parent
 _DB_PATH = os.environ.get("DB_PATH", str(_HERE.parent / "db" / "wrecks.db"))
 
+# Base URL used in NetworkLink KML hrefs.
+# Set API_BASE_URL to your Cloudflare/ngrok/tunnel public URL so Google Earth
+# can reach the live feed from anywhere.  Falls back to localhost.
+_API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:5001").rstrip("/")
+
 app = FastAPI(
     title="Great Lakes Wrecks API",
     description="Enhanced Swayze Great Lakes shipwreck database â€” 9,784 wrecks with NAMAG magnetic signatures, steel freighter ML classification, and BGSU hull material data.",
@@ -92,7 +105,85 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     return {k: row[k] for k in row.keys()}
 
 
-# â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Scan audit database â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+_SCAN_AUDIT_DB_PATH = os.environ.get(
+    "SCAN_AUDIT_DB_PATH",
+    str(Path(__file__).parent.parent / "db" / "scan_audit.db"),
+)
+
+
+@contextmanager
+def _get_scan_audit_db(write: bool = False):
+    audit_path = Path(_SCAN_AUDIT_DB_PATH)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    init = not audit_path.exists()
+    conn = sqlite3.connect(str(audit_path), check_same_thread=False, timeout=15)
+    conn.row_factory = sqlite3.Row
+    if write:
+        conn.execute("PRAGMA journal_mode=WAL")
+    else:
+        conn.execute("PRAGMA query_only = ON")
+    if init:
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS scan_audit (
+                id TEXT PRIMARY KEY,
+                created_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                status TEXT,
+                paths TEXT,
+                output_dir TEXT,
+                config TEXT,
+                swayze_match INTEGER,
+                swayze_radius_m REAL,
+                result_summary TEXT,
+                total_candidates INTEGER,
+                total_signatures INTEGER,
+                error TEXT,
+                research_mode INTEGER,
+                research_notes TEXT
+            );
+        ''')
+        conn.commit()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _update_scan_audit(job_id: str, **fields):
+    if not fields:
+        return
+    with _get_scan_audit_db(write=True) as conn:
+        placeholders = ", ".join([f"{k}=?" for k in fields.keys()])
+        params = list(fields.values()) + [job_id]
+        conn.execute(f"UPDATE scan_audit SET {placeholders} WHERE id=?", params)
+        conn.commit()
+
+
+def _insert_scan_audit(job_id: str, created_at: str, paths: list, output_dir: str, config: dict,
+                       swayze_match: bool, swayze_radius_m: float,
+                       research_mode: bool, research_notes: str):
+    with _get_scan_audit_db(write=True) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO scan_audit (id, created_at, status, paths, output_dir, config, swayze_match, swayze_radius_m, research_mode, research_notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                created_at,
+                'queued',
+                json.dumps(paths),
+                output_dir,
+                json.dumps(config or {}),
+                int(bool(swayze_match)),
+                float(swayze_radius_m),
+                int(bool(research_mode)),
+                research_notes or "",
+            ),
+        )
+        conn.commit()
+
+
+# â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 @app.get("/health", tags=["meta"])
 def health():
     with get_db() as conn:
@@ -191,7 +282,7 @@ def list_wrecks(
 
 
 # â”€â”€ Single wreck â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-@app.get("/wrecks/{wreck_id}", tags=["wrecks"])
+@app.get("/wrecks/{wreck_id:int}", tags=["wrecks"])
 def get_wreck(wreck_id: int):
     with get_db() as conn:
         c = conn.cursor()
@@ -433,6 +524,8 @@ class ScanRequest(BaseModel):
     config: dict = None
     swayze_match: bool = True
     swayze_radius_m: float = 2000.0
+    research_mode: bool = False
+    research_notes: str = ""
 
 
 JOBS = {}
@@ -442,6 +535,7 @@ def _run_scan_job(job_id: str, paths: list, output_dir: str, config: dict,
                   swayze_match: bool = True, swayze_radius_m: float = 2000.0):
     JOBS[job_id]['status'] = 'running'
     JOBS[job_id]['start_time'] = time.time()
+    _update_scan_audit(job_id, status='running', started_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
     try:
         cfg = config or {}
 
@@ -496,10 +590,30 @@ def _run_scan_job(job_id: str, paths: list, output_dir: str, config: dict,
         JOBS[job_id]['status'] = 'completed'
         JOBS[job_id]['result'] = results
         JOBS[job_id]['end_time'] = time.time()
+        total_candidates = sum(len(fr.get('candidates', [])) for fr in results.get('results', []))
+        total_signatures = results.get('total_signatures', 0) if isinstance(results.get('total_signatures', 0), int) else 0
+        _update_scan_audit(
+            job_id,
+            status='completed',
+            finished_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            result_summary=json.dumps({
+                'results': results.get('results', []),
+                'swayze_matches': results.get('swayze_matches', []),
+            }),
+            total_candidates=total_candidates,
+            total_signatures=total_signatures,
+            error=None,
+        )
     except Exception as e:
         JOBS[job_id]['status'] = 'failed'
         JOBS[job_id]['error'] = str(e)
         JOBS[job_id]['end_time'] = time.time()
+        _update_scan_audit(
+            job_id,
+            status='failed',
+            finished_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            error=str(e)[:2000],
+        )
 
 
 @app.post('/scan/start', tags=['scan'])
@@ -511,8 +625,22 @@ def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
         'paths': req.paths,
         'output_dir': req.output_dir,
         'config': req.config,
+        'research_mode': req.research_mode,
+        'research_notes': req.research_notes,
         'created': time.time()
     }
+
+    _insert_scan_audit(
+        job_id=job_id,
+        created_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        paths=req.paths,
+        output_dir=req.output_dir,
+        config=req.config or {},
+        swayze_match=req.swayze_match,
+        swayze_radius_m=req.swayze_radius_m,
+        research_mode=req.research_mode,
+        research_notes=req.research_notes,
+    )
 
     # Start background thread
     t = threading.Thread(
@@ -558,6 +686,81 @@ def scan_results(job_id: str):
         'swayze_matches': result.get('swayze_matches', []),
         'total_candidates': result.get('total_candidates', 0),
         'total_signatures': result.get('total_signatures', 0),
+    }
+
+
+@app.get('/scan/audit/yesterday', tags=['scan'])
+def scan_audit_yesterday():
+    today = datetime.utcnow().date()
+    yesterday = today - timedelta(days=1)
+    start_ts = datetime(yesterday.year, yesterday.month, yesterday.day)
+    end_ts = start_ts + timedelta(days=1)
+    start_key = start_ts.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_key = end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    with _get_scan_audit_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM scan_audit WHERE created_at >= ? AND created_at < ? ORDER BY total_candidates DESC",
+            (start_key, end_key)
+        ).fetchall()
+
+    tool_counts = {}
+    candidate_list = []
+    jobs = []
+
+    for row in rows:
+        result_summary = {}
+        try:
+            result_summary = json.loads(row['result_summary'] or '{}')
+        except Exception:
+            result_summary = {}
+
+        total_candidates = row['total_candidates'] or 0
+        total_signatures = row['total_signatures'] or 0
+        jobs.append({
+            'job_id': row['id'],
+            'status': row['status'],
+            'created_at': row['created_at'],
+            'finished_at': row['finished_at'],
+            'output_dir': row['output_dir'],
+            'research_mode': bool(row['research_mode']),
+            'research_notes': row['research_notes'] or '',
+            'config': json.loads(row['config'] or '{}'),
+            'total_candidates': total_candidates,
+            'total_signatures': total_signatures,
+        })
+
+        for fr in result_summary.get('results', []):
+            for cand in fr.get('candidates', []):
+                method = cand.get('method') or cand.get('source_file') or 'unknown'
+                tool_counts[method] = tool_counts.get(method, 0) + 1
+                candidate_list.append({
+                    'job_id': row['id'],
+                    'source_file': fr.get('file') or cand.get('source_file') or 'unknown',
+                    'latitude': cand.get('latitude'),
+                    'longitude': cand.get('longitude'),
+                    'confidence': cand.get('confidence'),
+                    'anomaly_score': cand.get('anomaly_score'),
+                    'method': method,
+                    'size_sq_feet': cand.get('size_sq_feet'),
+                    'size_sq_meters': cand.get('size_sq_meters'),
+                })
+
+    candidate_list.sort(key=lambda c: ((c['confidence'] or 0) * 1000 + (c['anomaly_score'] or 0)), reverse=True)
+    top_candidates = candidate_list[:8]
+    top_tools = [
+        {'tool': tool, 'count': count}
+        for tool, count in sorted(tool_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+    ]
+
+    return {
+        'date': yesterday.isoformat(),
+        'job_count': len(jobs),
+        'total_candidates': sum(j['total_candidates'] for j in jobs),
+        'total_signatures': sum(j['total_signatures'] for j in jobs),
+        'top_tools': top_tools,
+        'top_candidates': top_candidates,
+        'research_jobs': jobs,
     }
 
 
@@ -1423,6 +1626,64 @@ def list_sensor_reports(data_dir: str = "erie_remote_data"):
             pass
     return {'reports': reports, 'total': len(reports)}
 
+
+# ── PDF Breaker endpoints ─────────────────────────────────────────────────────
+
+class PdfBreakerStartRequest(BaseModel):
+    paths: list[str]
+    output_dir: str = "pdf_breaker_output"
+    config: dict = {}
+
+
+def _run_pdf_breaker_job(job_id: str, req: PdfBreakerStartRequest):
+    TOOL_JOBS[job_id]['status'] = 'running'
+    TOOL_JOBS[job_id]['start_time'] = time.time()
+    try:
+        from wrecks_api.stages.pdf_breaker_stage import run_pdf_breaker_stage
+        cfg = dict(req.config)
+        cfg['run_pdf_breaker'] = True
+        result = run_pdf_breaker_stage(req.paths, req.output_dir, cfg)
+        TOOL_JOBS[job_id]['status'] = result.get('status', 'completed')
+        TOOL_JOBS[job_id]['result'] = result
+    except Exception as e:
+        TOOL_JOBS[job_id]['status'] = 'failed'
+        TOOL_JOBS[job_id]['error'] = str(e)
+    TOOL_JOBS[job_id]['end_time'] = time.time()
+
+
+@app.post('/tools/pdf-breaker/start', tags=['tools'])
+def start_pdf_breaker(req: PdfBreakerStartRequest):
+    # Validate output_dir is not escaping to unexpected locations
+    out = Path(req.output_dir).resolve()
+    root = Path(__file__).resolve().parents[1]
+    if not str(out).startswith(str(root)):
+        raise HTTPException(status_code=400, detail='output_dir must be within the project directory')
+
+    job_id = str(uuid.uuid4())
+    TOOL_JOBS[job_id] = {
+        'id': job_id,
+        'tool': 'pdf_breaker',
+        'status': 'queued',
+        'output_dir': req.output_dir,
+        'created': time.time(),
+    }
+    t = threading.Thread(
+        target=_run_pdf_breaker_job,
+        args=(job_id, req),
+        daemon=True,
+    )
+    t.start()
+    return {'job_id': job_id, 'status': 'queued'}
+
+
+@app.get('/tools/pdf-breaker/status/{job_id}', tags=['tools'])
+def pdf_breaker_status(job_id: str):
+    job = TOOL_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='Job not found')
+    return {k: job[k] for k in job}
+
+
 class AutoBagRequest(BaseModel):
     throttle_mode: str  # "unfettered", "half", "custom"
     custom_kbps: Optional[int] = None
@@ -1434,6 +1695,11 @@ import subprocess
 def start_auto_bag(req: AutoBagRequest):
     import time
     job_id = str(uuid.uuid4())
+
+    # Validate scan_mode against allowlist
+    allowed_scan_modes = {"masked", "unmasked", "both"}
+    if req.scan_mode and req.scan_mode not in allowed_scan_modes:
+        raise HTTPException(status_code=400, detail=f'Invalid scan_mode. Must be one of: {", ".join(sorted(allowed_scan_modes))}')
 
         # Calculate throttle if needed
     throttle_kbps = None
@@ -1452,7 +1718,7 @@ def start_auto_bag(req: AutoBagRequest):
     elif req.throttle_mode == "custom" and req.custom_kbps:
         throttle_kbps = req.custom_kbps
 
-    cmd = ["python", "bag_auto_pipeline.py"]
+    cmd = [sys.executable, "bag_auto_pipeline.py"]
     if throttle_kbps:
         cmd.extend(["--throttle-kbps", str(throttle_kbps)])
     if req.scan_mode:
@@ -1676,3 +1942,1811 @@ def harvester_catalog(lake: str = 'erie'):
     with open(catalog_path, encoding='utf-8') as f:
         return json.load(f)
 
+
+# ── Live KML / Google Earth NetworkLink ─────────────────────────────────────
+# GET /wrecks/live.kml          — placemarks feed (Google Earth refreshes this)
+# GET /wrecks/networklink.kmz   — download-once KMZ containing the NetworkLink
+#
+# Usage:
+#   1.  Open networklink.kmz in Google Earth.  It stores the public URL so GE
+#       periodically re-fetches live.kml as the DB updates.
+#   2.  Set API_BASE_URL env-var to your Cloudflare / ngrok tunnel URL so the
+#       NetworkLink href resolves from anywhere (school, etc.).
+
+from fastapi.responses import Response as _Response
+import zipfile as _zipfile
+import io as _io
+import html as _html
+import xml.etree.ElementTree as _ET
+
+_KML_NS = 'http://www.opengis.net/kml/2.2'
+
+_ICON_BY_MAG = {
+    'strong':   'http://maps.google.com/mapfiles/kml/paddle/red-circle.png',
+    'moderate': 'http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png',
+    'weak':     'http://maps.google.com/mapfiles/kml/paddle/grn-circle.png',
+}
+_ICON_DEFAULT = 'http://maps.google.com/mapfiles/kml/paddle/wht-circle.png'
+
+
+def _build_wrecks_kml(
+    base_url: str,
+    limit: int = 2000,
+    magnetic_potential: str = None,
+    is_steel: bool = None,
+    min_lat: float = None, max_lat: float = None,
+    min_lon: float = None, max_lon: float = None,
+) -> str:
+    """Build a KML string with placemarks from the wrecks DB."""
+    where, params = ["latitude IS NOT NULL", "longitude IS NOT NULL"], []
+    if magnetic_potential:
+        where.append("magnetic_potential=?"); params.append(magnetic_potential)
+    if is_steel is True:
+        where.append("is_steel_freighter=1")
+    elif is_steel is False:
+        where.append("(is_steel_freighter=0 OR is_steel_freighter IS NULL)")
+    if min_lat is not None: where.append("latitude >= ?"); params.append(min_lat)
+    if max_lat is not None: where.append("latitude <= ?"); params.append(max_lat)
+    if min_lon is not None: where.append("longitude >= ?"); params.append(min_lon)
+    if max_lon is not None: where.append("longitude <= ?"); params.append(max_lon)
+
+    sql = (
+        "SELECT name,latitude,longitude,depth,date,hull_material,"
+        "magnetic_potential,is_steel_freighter,feature_type "
+        "FROM features WHERE " + " AND ".join(where) +
+        " ORDER BY CASE magnetic_potential WHEN 'strong' THEN 0 WHEN 'moderate' THEN 1 ELSE 2 END"
+        " LIMIT ?"
+    )
+    params.append(limit)
+
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<kml xmlns="{_KML_NS}">',
+        '<Document>',
+        f'  <name>Great Lakes Wrecks — live ({len(rows)} records)</name>',
+        '  <Style id="s_strong"><IconStyle><Icon><href>'
+            + _ICON_BY_MAG["strong"] + '</href></Icon><scale>1.1</scale></IconStyle></Style>',
+        '  <Style id="s_moderate"><IconStyle><Icon><href>'
+            + _ICON_BY_MAG["moderate"] + '</href></Icon><scale>1.0</scale></IconStyle></Style>',
+        '  <Style id="s_weak"><IconStyle><Icon><href>'
+            + _ICON_BY_MAG["weak"] + '</href></Icon><scale>0.9</scale></IconStyle></Style>',
+        '  <Style id="s_unknown"><IconStyle><Icon><href>'
+            + _ICON_DEFAULT + '</href></Icon><scale>0.8</scale></IconStyle></Style>',
+    ]
+    for r in rows:
+        mag  = r.get('magnetic_potential') or 'unknown'
+        style = f"s_{mag}" if mag in _ICON_BY_MAG else "s_unknown"
+        depth = f"{r['depth']} ft" if r.get('depth') else 'depth unknown'
+        steel = ' ★ Steel freighter' if r.get('is_steel_freighter') else ''
+        desc = _html.escape(
+            f"Date: {r.get('date') or '?'}  Depth: {depth}  "
+            f"Hull: {r.get('hull_material') or '?'}  Mag: {mag}{steel}"
+        )
+        name = _html.escape(r.get('name') or 'Unknown wreck')
+        lines += [
+            '  <Placemark>',
+            f'    <name>{name}</name>',
+            f'    <description>{desc}</description>',
+            f'    <styleUrl>#{style}</styleUrl>',
+            '    <Point>',
+            f'      <coordinates>{r["longitude"]},{r["latitude"]},0</coordinates>',
+            '    </Point>',
+            '  </Placemark>',
+        ]
+    lines += ['</Document>', '</kml>']
+    return '\n'.join(lines)
+
+
+@app.get('/wrecks/live.kml', tags=['google-earth'],
+         response_class=_Response,
+         summary='Live KML placemark feed — add as NetworkLink in Google Earth')
+def wrecks_live_kml(
+    limit: int = Query(2000, ge=1, le=10000),
+    magnetic_potential: Optional[str] = Query(None),
+    is_steel: Optional[bool] = Query(None),
+    min_lat: Optional[float] = Query(None), max_lat: Optional[float] = Query(None),
+    min_lon: Optional[float] = Query(None), max_lon: Optional[float] = Query(None),
+    base_url: Optional[str] = Query(None, description="Override API base URL in NetworkLink href"),
+):
+    kml = _build_wrecks_kml(
+        base_url=base_url or _API_BASE_URL,
+        limit=limit,
+        magnetic_potential=magnetic_potential,
+        is_steel=is_steel,
+        min_lat=min_lat, max_lat=max_lat,
+        min_lon=min_lon, max_lon=max_lon,
+    )
+    return _Response(content=kml, media_type='application/vnd.google-earth.kml+xml')
+
+
+@app.get('/wrecks/networklink.kmz', tags=['google-earth'],
+         response_class=_Response,
+         summary='Download this KMZ once — Google Earth will auto-refresh the live feed')
+def wrecks_networklink_kmz(
+    refresh_seconds: int = Query(300, ge=30, le=3600,
+                                  description="How often GE re-fetches the live feed (seconds)"),
+    base_url: Optional[str] = Query(None, description="Public API URL — set to your tunnel URL"),
+    limit: int = Query(2000, ge=1, le=10000),
+    magnetic_potential: Optional[str] = Query(None),
+    is_steel: Optional[bool] = Query(None),
+):
+    effective_base = (base_url or _API_BASE_URL).rstrip('/')
+    # Build query string for the live.kml href
+    qs_parts = [f"limit={limit}"]
+    if magnetic_potential: qs_parts.append(f"magnetic_potential={magnetic_potential}")
+    if is_steel is not None: qs_parts.append(f"is_steel={str(is_steel).lower()}")
+    live_url = f"{effective_base}/wrecks/live.kml?" + "&".join(qs_parts)
+
+    nl_kml = '\n'.join([
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<kml xmlns="{_KML_NS}">',
+        '<NetworkLink>',
+        '  <name>Great Lakes Wrecks — Live DB</name>',
+        '  <description>Auto-refreshes from the wreckhunter API every '
+            f'{refresh_seconds}s. Red=strong mag, Yellow=moderate, Green=weak.</description>',
+        '  <open>1</open>',
+        '  <Link>',
+        f'    <href>{_html.escape(live_url)}</href>',
+        '    <refreshMode>onInterval</refreshMode>',
+        f'    <refreshInterval>{refresh_seconds}</refreshInterval>',
+        '  </Link>',
+        '</NetworkLink>',
+        '</kml>',
+    ])
+
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, 'w', _zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('wrecks_live.kml', nl_kml)
+    buf.seek(0)
+    return _Response(
+        content=buf.read(),
+        media_type='application/vnd.google-earth.kmz',
+        headers={'Content-Disposition': 'attachment; filename="wrecks_live_networklink.kmz"'},
+    )
+
+
+# ── Scan Queue API ─────────────────────────────────────────────────────────────
+# These endpoints let you push/inspect scan jobs from anywhere (e.g. phone at sea).
+# The background scan_worker.py on i7/Xeon picks them up automatically.
+# Priority 0 = urgent user request (preempts everything).
+
+import importlib.util as _ilu
+
+def _queue() -> Optional[object]:
+    """Lazy-load scan_queue from repo root so the API stays importable even if
+    the file is absent (e.g. in older Docker images)."""
+    root = Path(__file__).resolve().parents[1]
+    spec = _ilu.spec_from_file_location("scan_queue", root / "scan_queue.py")
+    if spec is None:
+        return None
+    mod = _ilu.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        mod.init_db()
+        return mod
+    except Exception:
+        return None
+
+
+class _PushJobRequest(BaseModel):
+    label: str
+    bbox: list          # [lat_min, lon_min, lat_max, lon_max]
+    sensors: list       # e.g. ["thermal", "optical"]
+    priority: int = 0   # 0=urgent, 1=directed, 2=idle
+    params: dict = {}
+
+
+@app.get("/scan/queue", tags=["scan"])
+def scan_queue_list(limit: int = Query(default=30, le=200)):
+    """List recent scan jobs (most urgent first)."""
+    q = _queue()
+    if q is None:
+        raise HTTPException(503, "scan_queue module not available")
+    return q.list_jobs(limit=limit)
+
+
+@app.get("/scan/queue/depth", tags=["scan"])
+def scan_queue_depth():
+    """Return counts by status (QUEUED / RUNNING / DONE / FAILED)."""
+    q = _queue()
+    if q is None:
+        raise HTTPException(503, "scan_queue module not available")
+    return q.queue_depth()
+
+
+@app.post("/scan/queue", tags=["scan"], status_code=201)
+def scan_queue_push(job: _PushJobRequest):
+    """Push a new scan job. Priority 0 = interrupt current scan."""
+    if len(job.bbox) != 4:
+        raise HTTPException(400, "bbox must be [lat_min, lon_min, lat_max, lon_max]")
+    if not job.sensors:
+        raise HTTPException(400, "sensors list cannot be empty")
+    allowed = {"thermal", "optical", "triple_lock", "swot", "sar", "nir_swir"}
+    bad = set(job.sensors) - allowed
+    if bad:
+        raise HTTPException(400, f"Unknown sensors: {bad}. Allowed: {allowed}")
+    q = _queue()
+    if q is None:
+        raise HTTPException(503, "scan_queue module not available")
+    jid = q.push(label=job.label, bbox=job.bbox, sensors=job.sensors,
+                 priority=job.priority, params=job.params)
+    return {"job_id": jid, "priority": job.priority, "label": job.label}
+
+
+@app.delete("/scan/queue/{job_id}", tags=["scan"])
+def scan_queue_cancel(job_id: str):
+    """Cancel a queued job (has no effect on already-running jobs)."""
+    q = _queue()
+    if q is None:
+        raise HTTPException(503, "scan_queue module not available")
+    q.cancel(job_id)
+    return {"cancelled": job_id}
+
+
+@app.get("/scan/worker/state", tags=["scan"])
+def scan_worker_state():
+    """Return the on-disk state file written by scan_worker.py."""
+    state_path = Path(__file__).resolve().parents[1] / "db" / "worker_state.json"
+    if not state_path.exists():
+        return {"status": "no worker state found"}
+    try:
+        return json.loads(state_path.read_text())
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Worker / job dashboard ──────────────────────────────────────────────────
+
+_QUEUE_DB_PATH = os.environ.get(
+    "QUEUE_DB_PATH",
+    str(Path(__file__).resolve().parents[1] / "db" / "scan_queue.db"),
+)
+
+
+@contextmanager
+def _get_queue_db(write: bool = False):
+    if not Path(_QUEUE_DB_PATH).exists():
+        yield None
+        return
+    conn = sqlite3.connect(_QUEUE_DB_PATH, check_same_thread=False, timeout=15)
+    conn.row_factory = sqlite3.Row
+    if not write:
+        conn.execute("PRAGMA query_only = ON")
+    else:
+        conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+_queue_claim_lock = __import__("threading").Lock()  # serialise concurrent claims
+
+
+@app.get("/workers", tags=["workers"])
+def get_workers():
+    """
+    Return active workers (nodes with at least one RUNNING job)
+    and a summary of all job statuses.
+    """
+    with _get_queue_db() as conn:
+        if conn is None:
+            return {"workers": [], "summary": {}, "queue_available": False}
+
+        # Per-worker active jobs
+        rows = conn.execute(
+            "SELECT worker_id, id, label, sensors, params, started_at, bbox "
+            "FROM scan_jobs WHERE status='RUNNING' ORDER BY started_at ASC"
+        ).fetchall()
+
+        workers: dict[str, dict] = {}
+        for r in rows:
+            wid = r["worker_id"] or "unknown"
+            if wid not in workers:
+                workers[wid] = {"worker_id": wid, "jobs": []}
+            try:
+                params = json.loads(r["params"] or "{}")
+            except Exception:
+                params = {}
+            workers[wid]["jobs"].append({
+                "id": r["id"],
+                "label": r["label"],
+                "sensors": json.loads(r["sensors"] or "[]"),
+                "mission": params.get("mission_name", ""),
+                "target_type": params.get("target_type", ""),
+                "started_at": r["started_at"],
+                "bbox": json.loads(r["bbox"] or "[]"),
+            })
+
+        # Status summary counts
+        summary_rows = conn.execute(
+            "SELECT status, COUNT(*) n FROM scan_jobs GROUP BY status"
+        ).fetchall()
+        summary = {r["status"]: r["n"] for r in summary_rows}
+
+        return {
+            "workers": list(workers.values()),
+            "summary": summary,
+            "queue_available": True,
+        }
+
+
+@app.get("/jobs", tags=["workers"])
+def get_jobs(
+    status: Optional[str] = Query(None, description="QUEUED|RUNNING|DONE|FAILED"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """
+    Return recent jobs, optionally filtered by status.
+    Sorted newest first.
+    """
+    with _get_queue_db() as conn:
+        if conn is None:
+            return {"jobs": [], "total": 0, "queue_available": False}
+
+        where = "WHERE status=?" if status else ""
+        params_q: list = [status] if status else []
+        params_q.append(limit)
+
+        rows = conn.execute(
+            f"SELECT id, priority, status, label, sensors, params, "
+            f"created_at, started_at, finished_at, worker_id, error_msg, result_path "
+            f"FROM scan_jobs {where} "
+            f"ORDER BY COALESCE(started_at, created_at) DESC "
+            f"LIMIT ?",
+            params_q,
+        ).fetchall()
+
+        total_row = conn.execute(
+            f"SELECT COUNT(*) FROM scan_jobs {where}",
+            [status] if status else [],
+        ).fetchone()
+
+        jobs = []
+        for r in rows:
+            try:
+                p = json.loads(r["params"] or "{}")
+            except Exception:
+                p = {}
+            jobs.append({
+                "id": r["id"],
+                "priority": r["priority"],
+                "status": r["status"],
+                "label": r["label"],
+                "sensors": json.loads(r["sensors"] or "[]"),
+                "mission": p.get("mission_name", ""),
+                "target_type": p.get("target_type", ""),
+                "bbox": json.loads(r["bbox"] if "bbox" in r.keys() else "[]") if "bbox" in r.keys() else [],
+                "worker_id": r["worker_id"],
+                "created_at": r["created_at"],
+                "started_at": r["started_at"],
+                "finished_at": r["finished_at"],
+                "error_msg": r["error_msg"],
+                "result_path": r["result_path"],
+            })
+
+        return {"jobs": jobs, "total": total_row[0], "queue_available": True}
+
+
+# ── Node worker HTTP API (claim / finish / submit) ──────────────────────────
+
+class _ClaimBody(BaseModel):
+    worker_id: str
+    has_gpu: bool = False
+    has_tpu: bool = False
+    vram_gb: float = 0.0
+    max_jobs: int = 1  # how many RUNNING jobs this worker already has (for server-side info)
+
+
+class _FinishBody(BaseModel):
+    success: bool
+    result_path: str = ""
+    error_msg: str = ""
+
+
+class _SubmitJobBody(BaseModel):
+    label: str
+    bbox: list
+    sensors: list
+    params: dict = {}
+    priority: int = 1
+    # Legacy per-params flags kept for compatibility;
+    # prefer job_type for new submissions.
+    requires_gpu: bool = False
+    requires_tpu: bool = False
+    min_vram_gb: float = 0.0
+    # Job routing
+    job_type: str = "cpu"       # cpu | gpu | gpu_tpu
+    pipeline_stage: str = "process"  # process | postprocess
+    parent_id: str = ""
+
+
+class _HeartbeatBody(BaseModel):
+    worker_id: str
+    has_gpu: bool = False
+    has_tpu: bool = False
+    vram_gb: float = 0.0
+    gpu_label: str = ""
+
+
+@app.post("/jobs/claim", tags=["workers"])
+def claim_job_http(body: _ClaimBody):
+    """
+    Atomically claim the best matching QUEUED job for this worker.
+    Capability filtering: jobs with requires_gpu/requires_tpu in their params
+    are only returned to workers that advertise those capabilities.
+    Returns the full job dict, or {"job": null} if nothing suitable.
+    """
+    with _queue_claim_lock:
+        with _get_queue_db(write=True) as conn:
+            if conn is None:
+                raise HTTPException(503, "Queue DB not available")
+
+            # Fetch all QUEUED jobs in priority order, filter by capabilities.
+            # job_type column (added by migration) drives routing:
+            #   cpu      → any worker
+            #   gpu      → only workers with has_gpu
+            #   gpu_tpu  → only workers with both has_gpu and has_tpu
+            rows = conn.execute(
+                "SELECT * FROM scan_jobs WHERE status='QUEUED' "
+                "ORDER BY priority DESC, created_at ASC"
+            ).fetchall()
+
+            chosen = None
+            for r in rows:
+                cols = r.keys()
+                # job_type column may not exist on older DBs — fall back to params flags
+                job_type = r["job_type"] if "job_type" in cols else None
+                if job_type is None:
+                    try:
+                        p = json.loads(r["params"] or "{}")
+                    except Exception:
+                        p = {}
+                    if p.get("requires_tpu"):
+                        job_type = "gpu_tpu"
+                    elif p.get("requires_gpu"):
+                        job_type = "gpu"
+                    else:
+                        job_type = "cpu"
+
+                if job_type == "gpu_tpu" and not (body.has_gpu and body.has_tpu):
+                    continue
+                if job_type == "gpu" and not body.has_gpu:
+                    continue
+                # cpu jobs — allow any worker
+                chosen = dict(r)
+                break
+
+            if chosen is None:
+                return {"job": None}
+
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            affected = conn.execute(
+                "UPDATE scan_jobs SET status='RUNNING', started_at=?, worker_id=? "
+                "WHERE id=? AND status='QUEUED'",
+                (now, body.worker_id, chosen["id"]),
+            ).rowcount
+            conn.commit()
+
+            if affected == 0:
+                return {"job": None}  # race condition — someone else got it
+
+            chosen["status"] = "RUNNING"
+            chosen["started_at"] = now
+            chosen["worker_id"] = body.worker_id
+            # Decode JSON text fields
+            for field in ("bbox", "sensors", "params"):
+                val = chosen.get(field)
+                if isinstance(val, str):
+                    try:
+                        chosen[field] = json.loads(val)
+                    except Exception:
+                        pass
+            return {"job": chosen}
+
+
+@app.post("/jobs/{job_id}/finish", tags=["workers"])
+def finish_job_http(job_id: str, body: _FinishBody):
+    """Mark a job DONE or FAILED."""
+    from datetime import datetime, timezone
+    status = "DONE" if body.success else "FAILED"
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_queue_db(write=True) as conn:
+        if conn is None:
+            raise HTTPException(503, "Queue DB not available")
+        affected = conn.execute(
+            "UPDATE scan_jobs SET status=?, finished_at=?, result_path=?, error_msg=? "
+            "WHERE id=?",
+            (
+                status, now,
+                body.result_path if body.success else None,
+                None if body.success else body.error_msg[:4000],
+                job_id,
+            ),
+        ).rowcount
+        conn.commit()
+    if affected == 0:
+        raise HTTPException(404, f"Job {job_id} not found")
+    return {"ok": True, "status": status}
+
+
+@app.post("/jobs", tags=["workers"])
+def submit_job(body: _SubmitJobBody):
+    """Submit a new job to the queue."""
+    import uuid
+    from datetime import datetime, timezone
+    job_id = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc).isoformat()
+    params = dict(body.params)
+    # Derive job_type from legacy flags when caller didn't set it explicitly
+    job_type = body.job_type
+    if job_type == "cpu" and (body.requires_tpu or params.get("requires_tpu")):
+        job_type = "gpu_tpu"
+    elif job_type == "cpu" and (body.requires_gpu or params.get("requires_gpu")):
+        job_type = "gpu"
+
+    with _get_queue_db(write=True) as conn:
+        if conn is None:
+            raise HTTPException(503, "Queue DB not available")
+        conn.execute(
+            "INSERT INTO scan_jobs "
+            "(id, priority, status, label, bbox, sensors, params, created_at, "
+            " job_type, pipeline_stage, parent_id) "
+            "VALUES (?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, body.priority, body.label,
+             json.dumps(body.bbox), json.dumps(body.sensors),
+             json.dumps(params), now,
+             job_type,
+             body.pipeline_stage,
+             body.parent_id or None),
+        )
+        conn.commit()
+    return {"ok": True, "id": job_id}
+
+
+# ── Worker heartbeat / online roster ─────────────────────────────────────────
+
+@app.post("/workers/heartbeat", tags=["workers"])
+def worker_heartbeat(body: _HeartbeatBody):
+    """Workers call this every 30 s to advertise themselves as online."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_queue_db(write=True) as conn:
+        if conn is None:
+            raise HTTPException(503, "Queue DB not available")
+        conn.execute(
+            """
+            INSERT INTO worker_heartbeats (worker_id, has_gpu, has_tpu, vram_gb, gpu_label, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                has_gpu   = excluded.has_gpu,
+                has_tpu   = excluded.has_tpu,
+                vram_gb   = excluded.vram_gb,
+                gpu_label = excluded.gpu_label,
+                last_seen = excluded.last_seen
+            """,
+            (body.worker_id,
+             int(body.has_gpu), int(body.has_tpu),
+             body.vram_gb, body.gpu_label, now),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@app.get("/workers/online", tags=["workers"])
+def workers_online():
+    """Return workers that have sent a heartbeat within the last 90 s."""
+    with _get_queue_db() as conn:
+        if conn is None:
+            return {"workers": [], "queue_available": False}
+        # SQLite datetime comparison (ISO strings sort lexicographically)
+        rows = conn.execute(
+            """
+            SELECT worker_id, has_gpu, has_tpu, vram_gb, gpu_label, last_seen
+            FROM worker_heartbeats
+            WHERE last_seen >= datetime('now', '-90 seconds')
+            ORDER BY last_seen DESC
+            """
+        ).fetchall()
+        workers = [
+            {
+                "worker_id": r["worker_id"],
+                "has_gpu":   bool(r["has_gpu"]),
+                "has_tpu":   bool(r["has_tpu"]),
+                "vram_gb":   r["vram_gb"],
+                "gpu_label": r["gpu_label"],
+                "last_seen": r["last_seen"],
+            }
+            for r in rows
+        ]
+    return {"workers": workers, "count": len(workers), "queue_available": True}
+
+# ── Hardware Telemetry (Bypass Tauri) ────────────────────────────────────────
+
+TELEMETRY_STATE = {}
+_telemetry_lock = threading.Lock()
+
+class TelemetryPayload(BaseModel):
+    worker_id: str
+    platform: str
+    cpu_percent: float
+    ram_percent: float
+    gpus: list = []  # e.g. [{"name": "TITAN X", "load": 45.0, "memory_used": 4096, "memory_total": 12288}]
+    timestamp: float
+
+@app.post("/telemetry", tags=["workers"])
+def submit_telemetry(payload: TelemetryPayload):
+    """Store hardware telemetry from a worker node."""
+    with _telemetry_lock:
+        TELEMETRY_STATE[payload.worker_id] = payload.dict()
+    return {"ok": True}
+
+@app.get("/telemetry", tags=["workers"])
+def get_telemetry():
+    """Retrieve all recent hardware telemetry for the web dashboard."""
+    with _telemetry_lock:
+        return {"telemetry": list(TELEMETRY_STATE.values())}
+
+# ── Agent / AI Director / Mission REST endpoints (web-mode equivalents) ───────
+# These mirror the Tauri Rust commands so the browser build can call them via
+# fetch() instead of Tauri's invoke() IPC.  All subprocesses run from _REPO_ROOT.
+
+def _run_script(
+    script: str,
+    args: list,
+    cwd: Optional[str] = None,
+    timeout: int = 300,
+) -> dict:
+    """Run a Python script and return a TaskOutput-compatible dict."""
+    import time as _time
+    start = _time.time()
+    task_id = str(uuid.uuid4())
+    work_dir = Path(cwd) if cwd else _REPO_ROOT
+    cmd = [sys.executable, script] + [str(a) for a in (args or [])]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(work_dir),
+            timeout=timeout,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+        return {
+            "id": task_id,
+            "status": "success" if result.returncode == 0 else "error",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "duration_s": round(_time.time() - start, 2),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "id": task_id, "status": "error",
+            "stdout": "", "stderr": f"Timeout after {timeout}s",
+            "duration_s": float(timeout),
+        }
+    except Exception as exc:
+        return {
+            "id": task_id, "status": "error",
+            "stdout": "", "stderr": str(exc),
+            "duration_s": round(_time.time() - start, 2),
+        }
+
+
+class _AgentRequestBody(BaseModel):
+    request: str
+    provider: Optional[str] = "qwen"
+    model_override: Optional[str] = None
+
+
+class _MissionRunBody(BaseModel):
+    task_id: Optional[str] = None
+    mission_json: str
+
+
+class _NasaSearchBody(BaseModel):
+    bbox: list          # [lat_min, lon_min, lat_max, lon_max]
+    start_date: str
+    end_date: str
+    sensor: str = "hls"
+
+
+class _RunTaskBody(BaseModel):
+    task_id: Optional[str] = None
+    script: str
+    args: Optional[list] = []
+    cwd: Optional[str] = None
+
+
+@app.get("/tools/work-dir", tags=["agent"])
+def get_work_dir():
+    """Return the repo root used by agent scripts (web-mode equivalent of Tauri get_work_dir)."""
+    return {"work_dir": str(_REPO_ROOT)}
+
+
+@app.post("/tools/agent/request", tags=["agent"])
+def agent_request(body: _AgentRequestBody):
+    """Web-mode equivalent of Tauri ai_direct_request — runs ai_director.py."""
+    args = ["--request", body.request, "--execute"]
+    # Native providers need --provider flag; qwen/koboldcpp/github_sdk use env vars
+    if body.provider and body.provider not in ("qwen", "koboldcpp", "github_sdk"):
+        args += ["--provider", body.provider]
+    return _run_script("ai_director.py", args)
+
+
+@app.post("/tools/agent/probe", tags=["agent"])
+def agent_probe():
+    """Web-mode equivalent of Tauri run_background_probe — runs background_probe.py --once."""
+    return _run_script("background_probe.py", ["--once"])
+
+
+@app.get("/tools/nodes/check", tags=["agent"])
+def nodes_check():
+    """Web-mode equivalent of Tauri check_nodes — runs cesarops_orchestrator.py --status."""
+    return _run_script("cesarops_orchestrator.py", ["--status"])
+
+
+@app.get("/tools/agent/provider-status", tags=["agent"])
+def agent_provider_status_web(
+    provider: str = Query("qwen"),
+    model_override: Optional[str] = Query(None),
+):
+    """Web-mode equivalent of Tauri agent_provider_status — reads .env and checks provider."""
+    import socket
+    # Load .env from repo root
+    env_path = _REPO_ROOT / ".env"
+    dotenv: dict = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                dotenv[k.strip()] = v.strip()
+
+    def _env(key: str) -> Optional[str]:
+        return os.environ.get(key) or dotenv.get(key)
+
+    p = provider
+    m = (model_override or "").strip() or None
+    if p == "qwen":
+        base = _env("QWEN_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        model = m or _env("QWEN_MODEL") or "qwen-plus"
+        has_key = bool(_env("QWEN_API_KEY"))
+    elif p == "koboldcpp":
+        ts_ip = _env("KOBOLDCPP_TAILSCALE_IP") or _env("I7_TAILSCALE") or "100.85.138.4"
+        base = _env("KOBOLDCPP_BASE_URL") or f"http://{ts_ip}:5001/v1"
+        model = m or _env("KOBOLDCPP_MODEL") or "DeepSeek-R1-Distill-Qwen-7B"
+        has_key = bool(_env("KOBOLDCPP_API_KEY"))
+    elif p == "github_sdk":
+        base = _env("GITHUB_MODELS_BASE_URL") or "https://models.inference.ai.azure.com"
+        model = m or _env("GITHUB_MODEL") or "gpt-4.1"
+        has_key = bool(_env("GITHUB_TOKEN") or _env("GITHUB_PAT"))
+    elif p == "gemini":
+        base = _env("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/openai"
+        model = m or _env("GEMINI_MODEL") or "gemini-2.5-flash"
+        has_key = bool(_env("GEMINI_API_KEY"))
+    elif p == "anthropic":
+        base = _env("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1"
+        model = m or _env("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514"
+        has_key = bool(_env("ANTHROPIC_API_KEY"))
+    elif p == "groq":
+        base = _env("GROQ_BASE_URL") or "https://api.groq.com/openai/v1"
+        model = m or _env("GROQ_MODEL") or "llama-3.3-70b-versatile"
+        has_key = bool(_env("GROQ_API_KEY"))
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'")
+
+    def tcp_ok(url: str) -> bool:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            with socket.create_connection((parsed.hostname, port), timeout=1.2):
+                return True
+        except Exception:
+            return False
+
+    reachable = tcp_ok(base)
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(
+        f"Provider: {p}\n"
+        f"Base URL: {base}\n"
+        f"Model: {model}\n"
+        f"API key: {'present' if has_key else 'missing (local default)'}\n"
+        f"Endpoint: {'reachable \u2713' if reachable else 'not reachable \u2717'}"
+    )
+
+
+@app.post("/tools/mission/run", tags=["agent"])
+def mission_run(body: _MissionRunBody):
+    """Web-mode equivalent of Tauri run_mission — runs cesarops_mission.py."""
+    return _run_script("cesarops_mission.py", ["--mission-json", body.mission_json], timeout=600)
+
+
+@app.post("/tools/nasa/search", tags=["agent"])
+def nasa_search(body: _NasaSearchBody):
+    """Web-mode equivalent of Tauri search_nasa_granules — runs cmr_search.py."""
+    if len(body.bbox) != 4:
+        raise HTTPException(status_code=400, detail="bbox must have 4 elements: [lat_min, lon_min, lat_max, lon_max]")
+    bbox_str = ",".join(str(v) for v in body.bbox)
+    args = [
+        "--bbox", bbox_str,
+        "--start", body.start_date,
+        "--end", body.end_date,
+        "--sensor", body.sensor,
+        "--max-results", "50",
+    ]
+    result = _run_script("cmr_search.py", args)
+    if result["status"] == "success":
+        try:
+            return json.loads(result["stdout"])
+        except Exception:
+            raise HTTPException(status_code=502, detail=f"CMR parse error: {result['stdout'][:200]}")
+    raise HTTPException(status_code=500, detail=result["stderr"][:400])
+
+
+@app.post("/tools/run-task", tags=["agent"])
+def run_task_web(body: _RunTaskBody):
+    """Web-mode equivalent of Tauri run_task — run an arbitrary script from repo root."""
+    return _run_script(body.script, body.args or [], cwd=body.cwd)
+
+# ── Hardware info endpoint ───────────────────────────────────────────────────
+@app.get("/hardware", tags=["system"])
+def get_system_hardware():
+    """Get system hardware status including CPU, GPU temperatures, and NVIDIA SMI info."""
+    hardware_info = {
+        "cpu": {},
+        "gpu": {},
+        "nvidia_smi": {}
+    }
+
+    # CPU info using psutil
+    if HAS_PSUTIL:
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            cpu_freq = psutil.cpu_freq()
+            memory = psutil.virtual_memory()
+            hardware_info["cpu"] = {
+                "percent": cpu_percent,
+                "count": cpu_count,
+                "freq_mhz": round(cpu_freq.current, 1) if cpu_freq else None,
+                "memory_total_gb": round(memory.total / (1024**3), 1),
+                "memory_used_gb": round(memory.used / (1024**3), 1),
+                "memory_percent": memory.percent,
+            }
+        except Exception as e:
+            hardware_info["cpu"]["error"] = str(e)
+    else:
+        hardware_info["cpu"]["error"] = "psutil not available"
+
+    # GPU info using nvidia-smi
+    try:
+        result = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().split("\n")
+            gpus = []
+            for line in lines:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 6:
+                    gpus.append({
+                        "temperature_c": float(parts[0]),
+                        "utilization_percent": float(parts[1]),
+                        "memory_used_mb": float(parts[2]),
+                        "memory_total_mb": float(parts[3]),
+                        "power_draw_w": float(parts[4]),
+                        "power_limit_w": float(parts[5])
+                    })
+            hardware_info["gpu"]["nvidia"] = gpus
+        else:
+            hardware_info["gpu"]["error"] = result.stderr.strip()
+    except FileNotFoundError:
+        hardware_info["gpu"]["error"] = "nvidia-smi not found"
+    except Exception as e:
+        hardware_info["gpu"]["error"] = str(e)
+
+    # Full NVIDIA SMI output
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            hardware_info["nvidia_smi"]["output"] = result.stdout
+        else:
+            hardware_info["nvidia_smi"]["error"] = result.stderr.strip()
+    except Exception as e:
+        hardware_info["nvidia_smi"]["error"] = str(e)
+
+    return hardware_info
+
+
+
+
+# ── Kobold Agent endpoints ────────────────────────────────────────────────────
+# These endpoints let the frontend launch KoboldCPP and download models.
+# The frontend calls these on the wrecks API (port 8099); the backend
+# proxies launch commands to the local KoboldCPP process.
+
+_KOBOLD_PROCESSES: dict = {}  # track launched kobold subprocesses by key
+
+_KOBOLD_BASE_URL = os.environ.get(
+    "KOBOLD_BASE_URL",
+    _dotenv.get("KOBOLD_BASE_URL", "http://localhost:5001/v1")
+    if "_dotenv" in dir()
+    else "http://localhost:5001/v1",
+)
+
+# Resolve _dotenv safely (it's defined at module top in ai_director.py but not here)
+def _load_dotenv_safe() -> dict:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    result = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            result[k.strip()] = v.strip()
+    return result
+
+_kobold_env = _load_dotenv_safe()
+_KOBOLD_BASE_URL = os.environ.get(
+    "KOBOLD_BASE_URL",
+    _kobold_env.get("KOBOLD_BASE_URL", "http://localhost:5001/v1"),
+)
+_KOBOLD_HOST = _KOBOLD_BASE_URL.split("/v1")[0]  # e.g. http://localhost:5001
+
+
+# Allowlists for security
+_ALLOWED_GPU_MODES = {"p100_single", "p100_dual", "mixed_p100_1070"}
+_ALLOWED_MODELS = {
+    "Qwen2.5-Coder-7B-Instruct",
+    "Qwen2.5-Coder-14B-Instruct",
+    "DeepSeek-R1-Distill-Qwen-7B",
+    "DeepSeek-Coder-V2-Lite-Instruct",
+    "CodeLlama-7B-Instruct",
+    "CodeLlama-13B-Instruct",
+    "StarCoder2-7B",
+    "StarCoder2-3B",
+    "phi-3-mini",
+    "tinyllama",
+    "qwen1.5-0.5b",
+}
+
+
+class KoboldLaunchRequest(BaseModel):
+    model: str
+    gpu_mode: str = "p100_single"
+    model_path: str = "/mnt/garmour/models"
+    port: int = 5001
+    reasoning_model: str = ""
+
+
+class KoboldDownloadRequest(BaseModel):
+    model: str          # HuggingFace repo id, e.g. "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+    save_path: str = "/mnt/garmour/models"
+
+
+@app.get("/kobold/status", tags=["kobold"])
+def kobold_status():
+    """Check whether KoboldCPP is reachable and return its model info."""
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            f"{_KOBOLD_HOST}/api/v1/model",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read())
+        return {"online": True, "kobold_url": _KOBOLD_HOST, "model": data}
+    except Exception as e:
+        return {"online": False, "kobold_url": _KOBOLD_HOST, "error": str(e)}
+
+
+@app.post("/kobold/launch", tags=["kobold"])
+def kobold_launch(req: KoboldLaunchRequest):
+    """
+    Launch KoboldCPP with the requested model and GPU configuration.
+    Searches common Linux install locations for the binary.
+    """
+    # Validate inputs
+    if req.gpu_mode not in _ALLOWED_GPU_MODES:
+        raise HTTPException(status_code=400, detail=f"Invalid gpu_mode. Allowed: {sorted(_ALLOWED_GPU_MODES)}")
+
+    allowed_prefixes = ("/mnt/garmour", "/mnt/data", "/home", "/models", "/opt", "/root", "C:\\", "D:\\")
+    if not any(req.model_path.startswith(p) for p in allowed_prefixes):
+        raise HTTPException(status_code=400, detail="model_path must be within an allowed directory")
+
+    if not (1024 <= req.port <= 65535):
+        raise HTTPException(status_code=400, detail="port must be between 1024 and 65535")
+
+    root = Path(__file__).resolve().parents[1]
+
+    # ── Check if already running ──────────────────────────────────────────────
+    import urllib.request, urllib.error
+    try:
+        urllib.request.urlopen(f"http://localhost:{req.port}/api/v1/model", timeout=2)
+        return {
+            "status": "already_running",
+            "message": f"KoboldCPP is already running on port {req.port}",
+            "kobold_url": f"http://localhost:{req.port}/v1",
+        }
+    except Exception:
+        pass
+
+    # ── Find KoboldCPP binary (Linux search order) ────────────────────────────
+    home = Path.home()
+    kobold_candidates = [
+        home / "ai_coding" / "koboldcpp",
+        home / "koboldcpp" / "koboldcpp",
+        home / "koboldcpp",
+        Path("/opt/koboldcpp/koboldcpp-linux-x64"),
+        Path("/opt/koboldcpp/koboldcpp"),
+        Path("/usr/local/bin/koboldcpp"),
+        Path("/usr/bin/koboldcpp"),
+        root / "koboldcpp",
+        root / "koboldcpp-linux-x64",
+    ]
+    kobold_bin = next((p for p in kobold_candidates if p.exists() and p.is_file()), None)
+
+    # ── Find model file ───────────────────────────────────────────────────────
+    model_file = None
+    model_dir = Path(req.model_path)
+    if model_dir.exists():
+        model_lower = req.model.lower().replace("-", "").replace("_", "")
+        # Try exact name match first
+        for ext in ("*.gguf", "*.onnx"):
+            for f in model_dir.glob(ext):
+                fname_lower = f.name.lower().replace("-", "").replace("_", "")
+                if model_lower[:12] in fname_lower:
+                    model_file = str(f)
+                    break
+            if model_file:
+                break
+        # Fall back to first .gguf found
+        if not model_file:
+            gguf_files = sorted(model_dir.glob("*.gguf"))
+            if gguf_files:
+                model_file = str(gguf_files[0])
+
+    # ── GPU layer count ───────────────────────────────────────────────────────
+    gpu_layers = {"p100_single": 28, "p100_dual": 56, "mixed_p100_1070": 32}.get(req.gpu_mode, 28)
+
+    try:
+        if kobold_bin:
+            # Direct binary launch
+            cmd = [str(kobold_bin), "--port", str(req.port),
+                   "--gpulayers", str(gpu_layers),
+                   "--contextsize", "4096", "--threads", "8"]
+            if model_file:
+                cmd += ["--model", model_file]
+
+            proc = subprocess.Popen(
+                cmd, cwd=str(root),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            _KOBOLD_PROCESSES[req.port] = proc
+            return {
+                "status": "launching",
+                "pid": proc.pid,
+                "binary": str(kobold_bin),
+                "model": req.model,
+                "model_file": model_file,
+                "gpu_mode": req.gpu_mode,
+                "gpu_layers": gpu_layers,
+                "kobold_url": f"http://localhost:{req.port}/v1",
+                "message": f"KoboldCPP launching on port {req.port} with {gpu_layers} GPU layers. Poll /kobold/status to confirm.",
+            }
+
+        # ── Launcher script fallback ──────────────────────────────────────────
+        launcher = root / "scripts" / "launch_koboldcpp.py"
+        if launcher.exists():
+            cmd = [sys.executable, str(launcher), "--port", str(req.port)]
+            if req.gpu_mode == "p100_single":
+                cmd += ["--gpu-ids", "0"]
+            elif req.gpu_mode in ("p100_dual", "mixed_p100_1070"):
+                cmd += ["--gpu-ids", "0,1"]
+            if model_file:
+                cmd += ["--model", model_file]
+
+            proc = subprocess.Popen(cmd, cwd=str(root),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _KOBOLD_PROCESSES[req.port] = proc
+            return {
+                "status": "launching",
+                "pid": proc.pid,
+                "model_file": model_file,
+                "kobold_url": f"http://localhost:{req.port}/v1",
+                "message": f"KoboldCPP launching via launcher script on port {req.port}.",
+            }
+
+        # ── Nothing found — give install instructions ─────────────────────────
+        return {
+            "status": "not_installed",
+            "kobold_url": f"http://localhost:{req.port}/v1",
+            "message": (
+                "KoboldCPP binary not found. Install it:\n"
+                "  bash install_kobold.sh\n"
+                "or download from https://github.com/LostRuins/koboldcpp/releases\n"
+                "and place at ~/koboldcpp or /opt/koboldcpp/koboldcpp-linux-x64"
+            ),
+            "searched": [str(p) for p in kobold_candidates],
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to launch KoboldCPP: {e}")
+
+
+@app.post("/kobold/download-model", tags=["kobold"])
+def kobold_download_model(req: KoboldDownloadRequest):
+    """
+    Download a GGUF model from HuggingFace to the specified path.
+    Uses huggingface_hub if available, otherwise falls back to wget/curl.
+    """
+    # Validate save_path
+    allowed_prefixes = ("/mnt/garmour", "/mnt/data", "/home", "/models", "C:\\", "D:\\")
+    if not any(req.save_path.startswith(p) for p in allowed_prefixes):
+        raise HTTPException(status_code=400, detail="save_path must be within an allowed directory")
+
+    # Validate model name — must look like a HuggingFace repo id (owner/repo)
+    import re as _re
+    if not _re.match(r'^[\w\-\.]+/[\w\-\.]+$', req.model):
+        raise HTTPException(
+            status_code=400,
+            detail="model must be a valid HuggingFace repo id (e.g. 'Qwen/Qwen2.5-Coder-7B-Instruct-GGUF')"
+        )
+
+    save_dir = Path(req.save_path)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = str(uuid.uuid4())
+    TOOL_JOBS[job_id] = {
+        "id": job_id,
+        "tool": "kobold_download",
+        "status": "queued",
+        "model": req.model,
+        "save_path": req.save_path,
+        "created": time.time(),
+    }
+
+    def _do_download(job_id: str, model: str, save_path: str):
+        TOOL_JOBS[job_id]["status"] = "running"
+        TOOL_JOBS[job_id]["start_time"] = time.time()
+        try:
+            try:
+                from huggingface_hub import snapshot_download
+                local_dir = snapshot_download(
+                    repo_id=model,
+                    local_dir=save_path,
+                    ignore_patterns=["*.bin", "*.pt", "*.safetensors"],  # GGUF only
+                )
+                TOOL_JOBS[job_id]["status"] = "completed"
+                TOOL_JOBS[job_id]["result"] = {"local_dir": local_dir}
+            except ImportError:
+                # Fall back to subprocess wget
+                url = f"https://huggingface.co/{model}/resolve/main"
+                cmd = ["wget", "-P", save_path, "-r", "-l1", "--no-parent",
+                       "-A", "*.gguf", url]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                if proc.returncode == 0:
+                    TOOL_JOBS[job_id]["status"] = "completed"
+                    TOOL_JOBS[job_id]["result"] = {"save_path": save_path}
+                else:
+                    TOOL_JOBS[job_id]["status"] = "failed"
+                    TOOL_JOBS[job_id]["error"] = proc.stderr[-500:]
+        except Exception as e:
+            TOOL_JOBS[job_id]["status"] = "failed"
+            TOOL_JOBS[job_id]["error"] = str(e)
+        TOOL_JOBS[job_id]["end_time"] = time.time()
+
+    t = threading.Thread(
+        target=_do_download,
+        args=(job_id, req.model, req.save_path),
+        daemon=True,
+    )
+    t.start()
+    return {"job_id": job_id, "status": "queued", "model": req.model, "save_path": req.save_path}
+
+
+@app.get("/kobold/download-status/{job_id}", tags=["kobold"])
+def kobold_download_status(job_id: str):
+    """Poll download job status."""
+    job = TOOL_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {k: job[k] for k in job}
+
+
+@app.post("/kobold/upload-model", tags=["kobold"])
+async def kobold_upload_model(
+    file: UploadFile = File(...),
+    save_path: str = Form("/mnt/garmour/models"),
+):
+    """
+    Accept a .gguf or .onnx file upload from the browser and save it to
+    the server's model directory (save_path).
+    """
+    import shutil as _shutil
+
+    # Validate extension
+    filename = file.filename or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ("gguf", "onnx"):
+        raise HTTPException(status_code=400, detail="Only .gguf and .onnx files are accepted")
+
+    # Validate save_path stays within allowed mounts
+    allowed_prefixes = ("/mnt/garmour", "/mnt/data", "/home", "/models", "C:\\", "D:\\")
+    if not any(save_path.startswith(p) for p in allowed_prefixes):
+        raise HTTPException(status_code=400, detail="save_path must be within an allowed directory")
+
+    dest_dir = Path(save_path)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_file = dest_dir / filename
+
+    # Stream to disk
+    try:
+        with open(dest_file, "wb") as out:
+            _shutil.copyfileobj(file.file, out)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    finally:
+        await file.close()
+
+    size_mb = dest_file.stat().st_size / (1024 * 1024)
+    return {
+        "saved_path": str(dest_file),
+        "filename": filename,
+        "size_mb": round(size_mb, 2),
+        "message": f"Saved {filename} ({size_mb:.1f} MB) to {save_path}",
+    }
+
+
+# ── Unified Search / Orchestrator endpoint ───────────────────────────────────
+# This is the primary entry point for the "type what you're looking for" UI.
+# It accepts natural language, parses intent (with LLM or keyword fallback),
+# queues a scan job, and returns a job_id to poll.
+#
+# Workers are pure knob-turners — they don't write new code, they just receive
+# a mission spec with tuned parameters and execute it.
+
+import re as _re
+
+# ── Lake bounding boxes ───────────────────────────────────────────────────────
+_LAKE_BBOXES = {
+    "superior":  [46.5, -92.0, 48.5, -84.5],
+    "michigan":  [41.5, -88.0, 46.0, -84.5],
+    "huron":     [43.0, -84.5, 46.5, -79.5],
+    "erie":      [41.3, -83.5, 42.9, -78.8],
+    "ontario":   [43.2, -79.9, 44.3, -76.0],
+    "straits":   [45.6, -85.0, 46.1, -84.0],
+    "mackinac":  [45.6, -85.0, 46.1, -84.0],
+}
+
+# ── Target type → sensor/pass mapping ────────────────────────────────────────
+_TARGET_SENSORS = {
+    "wreck":      ["thermal", "optical", "sar"],
+    "ship":       ["thermal", "optical", "sar"],
+    "vessel":     ["thermal", "optical", "sar"],
+    "freighter":  ["thermal", "optical", "sar"],
+    "aircraft":   ["optical", "sar", "ndvi"],
+    "plane":      ["optical", "sar", "ndvi"],
+    "car":        ["optical", "sar"],
+    "vehicle":    ["optical", "sar"],
+    "person":     ["thermal", "optical"],
+    "missing":    ["thermal", "optical", "sar"],
+    "hydrocarbon":["hls", "swir"],
+    "oil":        ["hls", "swir"],
+    "leak":       ["hls", "swir"],
+    "magnetic":   ["magnetics"],
+    "anomaly":    ["thermal", "optical", "sar", "magnetics"],
+}
+
+_TARGET_PASSES = {
+    "wreck":      [1, 2, 3, 4, 7],
+    "ship":       [1, 2, 3, 4, 7],
+    "vessel":     [1, 2, 3, 4, 7],
+    "freighter":  [1, 2, 3, 4, 7],
+    "aircraft":   [1, 3, 4],
+    "plane":      [1, 3, 4],
+    "car":        [1, 3],
+    "vehicle":    [1, 3],
+    "person":     [1, 3],
+    "missing":    [1, 2, 3, 4, 7],
+    "hydrocarbon":[2, 5, 6],
+    "oil":        [2, 5, 6],
+    "leak":       [2, 5, 6],
+    "magnetic":   [4],
+    "anomaly":    [1, 2, 3, 4, 5, 6, 7],
+}
+
+# ── Sensitivity keywords ──────────────────────────────────────────────────────
+_SENSITIVITY_KEYWORDS = {
+    "aggressive": 1.2,
+    "sensitive":  1.3,
+    "thorough":   1.4,
+    "deep":       1.5,
+    "standard":   2.0,
+    "normal":     2.0,
+    "conservative": 2.5,
+    "strict":     2.8,
+}
+
+
+def _parse_search_intent(query: str) -> dict:
+    """
+    Parse a natural language search query into a structured mission spec.
+    Uses keyword matching — no LLM required, but LLM can override if available.
+
+    Returns a dict compatible with mission_control.py's mission spec schema.
+    """
+    q = query.lower()
+
+    # ── Detect lake / area ────────────────────────────────────────────────────
+    bbox = None
+    area_label = "Great Lakes"
+    for lake, bb in _LAKE_BBOXES.items():
+        if lake in q:
+            bbox = bb
+            area_label = f"Lake {lake.title()}"
+            break
+
+    # ── Detect target type ────────────────────────────────────────────────────
+    target_type = "wreck"  # default
+    sensors = _TARGET_SENSORS["wreck"]
+    passes = _TARGET_PASSES["wreck"]
+    for kw in _TARGET_SENSORS:
+        if kw in q:
+            target_type = kw
+            sensors = _TARGET_SENSORS[kw]
+            passes = _TARGET_PASSES[kw]
+            break
+
+    # ── Detect named target (quoted or capitalized) ───────────────────────────
+    target_name = None
+    # Look for quoted name
+    m = _re.search(r'"([^"]+)"', query)
+    if m:
+        target_name = m.group(1)
+    else:
+        # Look for known wreck names in the DB
+        try:
+            with get_db() as conn:
+                # Extract capitalized words as potential names
+                words = _re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
+                for phrase in words:
+                    if len(phrase) > 3:
+                        row = conn.execute(
+                            "SELECT name FROM features WHERE UPPER(name) LIKE UPPER(?) LIMIT 1",
+                            (f"%{phrase}%",)
+                        ).fetchone()
+                        if row:
+                            target_name = row["name"]
+                            break
+        except Exception:
+            pass
+
+    # ── Detect sensitivity ────────────────────────────────────────────────────
+    sensitivity = 2.0
+    for kw, val in _SENSITIVITY_KEYWORDS.items():
+        if kw in q:
+            sensitivity = val
+            break
+
+    # ── Detect date range ─────────────────────────────────────────────────────
+    # Look for year mentions
+    years = _re.findall(r'\b(19[0-9]{2}|20[0-2][0-9])\b', query)
+    if len(years) >= 2:
+        date_range = [f"{min(years)}-01-01", f"{max(years)}-12-31"]
+    elif len(years) == 1:
+        date_range = [f"{years[0]}-01-01", f"{years[0]}-12-31"]
+    else:
+        # Default: last 2 years
+        from datetime import datetime as _dt
+        now = _dt.utcnow()
+        date_range = [f"{now.year - 2}-01-01", f"{now.year}-12-31"]
+
+    # ── Weather filter ────────────────────────────────────────────────────────
+    weather_filter = "calm_and_post_storm"
+    if "storm" in q:
+        weather_filter = "post_storm"
+    elif "calm" in q:
+        weather_filter = "calm"
+
+    # ── Build mission spec ────────────────────────────────────────────────────
+    mission_id = f"SEARCH_{int(time.time())}"
+    spec = {
+        "mission_id": mission_id,
+        "query": query,
+        "target_name": target_name or target_type.title(),
+        "target_type": target_type,
+        "area_label": area_label,
+        "bbox": bbox or [41.3, -92.0, 48.5, -76.0],  # all Great Lakes fallback
+        "date_range": date_range,
+        "sensors": sensors,
+        "weather_filter": weather_filter,
+        "passes": passes,
+        "knobs": {
+            "hc_threshold": sensitivity,
+            "silt_erasure_threshold": sensitivity + 0.5,
+            "displacement_min_delta": sensitivity,
+            "mussel_clearspot_top_n": 30,
+            "max_download_results": 200,
+            "post_storm_days": 3,
+            "calm_max_wind_kmh": 15.0,
+            "storm_min_wind_kmh": 28.0,
+        },
+        "output": {
+            "db_path": None,
+            "scan_group": target_type,
+        },
+    }
+    return spec
+
+
+def _try_llm_parse(query: str, spec: dict) -> dict:
+    """
+    Optionally refine the keyword-parsed spec using the local LLM.
+    Falls back to the keyword spec if LLM is unavailable or slow.
+    """
+    kobold_url = _kobold_env.get("KOBOLD_BASE_URL", "http://localhost:5001/v1")
+    try:
+        import urllib.request as _ur
+        prompt = (
+            "You are a search-and-rescue mission planner. "
+            "Given this user query, output ONLY a JSON object with these fields: "
+            "target_name (string), target_type (string), area_label (string), "
+            "bbox ([lat_min,lon_min,lat_max,lon_max]), date_range ([start,end]), "
+            "sensors (list), passes (list of ints 1-7), weather_filter (string), "
+            "sensitivity (float 1.0-3.0).\n\n"
+            f"Query: {query}\n\n"
+            "JSON:"
+        )
+        payload = json.dumps({
+            "prompt": prompt,
+            "max_tokens": 300,
+            "temperature": 0.1,
+            "stop": ["\n\n", "```"],
+        }).encode()
+        req = _ur.Request(
+            f"{kobold_url.rstrip('/v1').rstrip('/')}/api/v1/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        text = data.get("results", [{}])[0].get("text", "")
+        # Extract JSON from response
+        m = _re.search(r'\{.*\}', text, _re.DOTALL)
+        if m:
+            llm_spec = json.loads(m.group(0))
+            # Merge LLM refinements into keyword spec
+            for key in ("target_name", "target_type", "area_label", "bbox",
+                        "date_range", "sensors", "passes", "weather_filter"):
+                if key in llm_spec and llm_spec[key]:
+                    spec[key] = llm_spec[key]
+            if "sensitivity" in llm_spec:
+                s = float(llm_spec["sensitivity"])
+                spec["knobs"]["hc_threshold"] = s
+                spec["knobs"]["silt_erasure_threshold"] = s + 0.5
+                spec["knobs"]["displacement_min_delta"] = s
+    except Exception:
+        pass  # LLM unavailable — keyword spec is fine
+    return spec
+
+
+class SearchRequest(BaseModel):
+    query: str
+    use_llm: bool = True   # attempt LLM refinement of the parsed spec
+
+
+class SearchJobStatus(BaseModel):
+    job_id: str
+    status: str
+    query: str
+    spec: dict
+    created: float
+    started: Optional[float] = None
+    finished: Optional[float] = None
+    error: Optional[str] = None
+    result_summary: Optional[dict] = None
+
+
+# In-memory search job store (survives process lifetime)
+_SEARCH_JOBS: dict = {}
+
+
+def _run_search_job(job_id: str, spec: dict):
+    """
+    Background thread: run mission_control.py with the parsed spec.
+    Workers just turn knobs — they receive the spec and execute.
+    """
+    _SEARCH_JOBS[job_id]["status"] = "running"
+    _SEARCH_JOBS[job_id]["started"] = time.time()
+
+    root = Path(__file__).resolve().parents[1]
+    mission_control = root / "mission_control.py"
+
+    try:
+        # Write spec to a temp file
+        spec_path = root / "outputs" / f"search_{job_id}.json"
+        spec_path.parent.mkdir(parents=True, exist_ok=True)
+        spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+
+        if mission_control.exists():
+            cmd = [
+                sys.executable, str(mission_control),
+                "--spec", str(spec_path),
+            ]
+            proc = subprocess.run(
+                cmd,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=3600,  # 1 hour max
+            )
+            stdout = proc.stdout[-4000:] if proc.stdout else ""
+            stderr = proc.stderr[-2000:] if proc.stderr else ""
+
+            if proc.returncode == 0:
+                _SEARCH_JOBS[job_id]["status"] = "completed"
+                _SEARCH_JOBS[job_id]["result_summary"] = {
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "spec": spec,
+                    "output_dir": str(root / "outputs" / spec["mission_id"]),
+                }
+            else:
+                _SEARCH_JOBS[job_id]["status"] = "failed"
+                _SEARCH_JOBS[job_id]["error"] = stderr or f"exit code {proc.returncode}"
+                _SEARCH_JOBS[job_id]["result_summary"] = {"stdout": stdout, "stderr": stderr}
+        else:
+            # mission_control.py not found — push to scan queue as fallback
+            import scan_queue as _sq
+            _sq.init_db()
+            qjob_id = _sq.push(
+                label=spec.get("target_name", spec["query"][:60]),
+                bbox=spec["bbox"],
+                sensors=spec.get("sensors", ["thermal", "optical", "sar"]),
+                priority=_sq.PRIORITY_USER,
+                params={
+                    "query": spec["query"],
+                    "passes": spec.get("passes", [1, 2, 3]),
+                    "knobs": spec.get("knobs", {}),
+                    "weather_filter": spec.get("weather_filter", "calm_and_post_storm"),
+                    "date_range": spec.get("date_range", []),
+                },
+            )
+            _SEARCH_JOBS[job_id]["status"] = "queued_to_worker"
+            _SEARCH_JOBS[job_id]["result_summary"] = {
+                "queue_job_id": qjob_id,
+                "message": "Queued to scan worker daemon (mission_control.py not found)",
+                "spec": spec,
+            }
+
+    except subprocess.TimeoutExpired:
+        _SEARCH_JOBS[job_id]["status"] = "failed"
+        _SEARCH_JOBS[job_id]["error"] = "Mission timed out after 1 hour"
+    except Exception as e:
+        _SEARCH_JOBS[job_id]["status"] = "failed"
+        _SEARCH_JOBS[job_id]["error"] = str(e)
+
+    _SEARCH_JOBS[job_id]["finished"] = time.time()
+
+
+@app.post("/search", tags=["search"], status_code=202)
+def submit_search(req: SearchRequest):
+    """
+    Primary entry point: user types what they're looking for.
+    Parses intent, builds a mission spec, queues it to the worker pipeline.
+    Returns a job_id to poll for status and results.
+    """
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="query cannot be empty")
+
+    # Parse intent from natural language
+    spec = _parse_search_intent(req.query.strip())
+
+    # Optionally refine with LLM (non-blocking — falls back to keyword spec)
+    if req.use_llm:
+        spec = _try_llm_parse(req.query.strip(), spec)
+
+    job_id = spec["mission_id"]
+    _SEARCH_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "query": req.query,
+        "spec": spec,
+        "created": time.time(),
+        "started": None,
+        "finished": None,
+        "error": None,
+        "result_summary": None,
+    }
+
+    t = threading.Thread(target=_run_search_job, args=(job_id, spec), daemon=True)
+    t.start()
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "spec": spec,
+        "message": (
+            f"Searching for {spec['target_type']} in {spec['area_label']} "
+            f"({spec['date_range'][0]} – {spec['date_range'][1]}). "
+            f"Poll /search/{job_id} for status."
+        ),
+    }
+
+
+@app.get("/search/{job_id}", tags=["search"])
+def get_search_status(job_id: str):
+    """Poll search job status and results."""
+    job = _SEARCH_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Search job not found")
+    return job
+
+
+@app.get("/search", tags=["search"])
+def list_searches(limit: int = Query(20, ge=1, le=100)):
+    """List recent search jobs, newest first."""
+    jobs = sorted(_SEARCH_JOBS.values(), key=lambda j: j["created"], reverse=True)
+    return {"total": len(jobs), "jobs": jobs[:limit]}
+
+
+@app.get("/search/{job_id}/report", tags=["search"])
+def get_search_report(job_id: str):
+    """
+    Return a human-readable report for a completed search job.
+    Aggregates: spec, detections from DB, wreck DB matches, scan output.
+    """
+    job = _SEARCH_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Search job not found")
+
+    spec = job.get("spec", {})
+    result = job.get("result_summary", {})
+    status = job.get("status", "unknown")
+
+    # Try to load detections from the output directory
+    detections = []
+    output_dir = result.get("output_dir") if result else None
+    if output_dir:
+        out_path = Path(output_dir)
+        for jf in sorted(out_path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(jf.read_text(encoding="utf-8"))
+                if "candidates" in data or "detections" in data:
+                    detections = data.get("candidates", data.get("detections", []))
+                    break
+            except Exception:
+                pass
+
+    # Cross-reference detections against wreck DB
+    wreck_matches = []
+    if detections:
+        try:
+            wreck_matches = _match_swayze_wrecks(detections[:50], search_radius_m=3000.0)
+        except Exception:
+            pass
+
+    # Build elapsed time
+    elapsed = None
+    if job.get("started") and job.get("finished"):
+        elapsed = round(job["finished"] - job["started"], 1)
+    elif job.get("started"):
+        elapsed = round(time.time() - job["started"], 1)
+
+    return {
+        "job_id": job_id,
+        "status": status,
+        "query": job.get("query", ""),
+        "elapsed_seconds": elapsed,
+        "spec": {
+            "target": spec.get("target_name"),
+            "target_type": spec.get("target_type"),
+            "area": spec.get("area_label"),
+            "bbox": spec.get("bbox"),
+            "date_range": spec.get("date_range"),
+            "sensors": spec.get("sensors"),
+            "passes": spec.get("passes"),
+            "sensitivity": spec.get("knobs", {}).get("hc_threshold", 2.0),
+        },
+        "detections": {
+            "count": len(detections),
+            "top": detections[:10],
+        },
+        "wreck_db_matches": {
+            "count": len(wreck_matches),
+            "top": wreck_matches[:5],
+        },
+        "output": result or {},
+        "idle_status": _get_idle_status(),
+    }
+
+
+def _get_idle_status() -> dict:
+    """Return current idle worker state from the state file."""
+    state_path = Path(__file__).resolve().parents[1] / "db" / "worker_state.json"
+    if not state_path.exists():
+        return {"running": False, "message": "Worker not started"}
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"running": False, "message": "Could not read worker state"}
+
+
+@app.get("/search/idle/status", tags=["search"])
+def idle_status():
+    """Return the current idle scan worker state."""
+    return _get_idle_status()
+
+
+# ── Watchdog status endpoints ─────────────────────────────────────────────────
+# These let the frontend read the watchdog state file and trigger restarts.
+
+@app.get("/watchdog/status", tags=["watchdog"])
+def watchdog_status():
+    """Return the current watchdog state (written by watchdog.py)."""
+    state_path = Path(__file__).resolve().parents[1] / "db" / "watchdog_state.json"
+    if not state_path.exists():
+        return {"running": False, "message": "Watchdog not running. Deploy with: bash scripts/deploy_services.sh"}
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"running": False, "error": str(e)}
+
+
+@app.post("/watchdog/start-api", tags=["watchdog"])
+def watchdog_start_api():
+    """
+    Ask systemd to start the wrecks-api service.
+    Only works if the calling process has sudo rights or the service is user-level.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "start", "wrecks-api"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return {"status": "started", "message": "wrecks-api started via systemd --user"}
+        # Try system-level (requires sudo or polkit)
+        result2 = subprocess.run(
+            ["sudo", "-n", "systemctl", "start", "wrecks-api"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result2.returncode == 0:
+            return {"status": "started", "message": "wrecks-api started via systemd"}
+        return {"status": "failed", "message": result2.stderr.strip() or result.stderr.strip()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/watchdog/restart", tags=["watchdog"])
+def watchdog_restart_all():
+    """Restart all CESAROPS services via systemd."""
+    results = {}
+    for svc in ("wrecks-api", "koboldcpp", "scan-worker"):
+        try:
+            r = subprocess.run(
+                ["sudo", "-n", "systemctl", "restart", svc],
+                capture_output=True, text=True, timeout=15,
+            )
+            results[svc] = "restarted" if r.returncode == 0 else f"failed: {r.stderr.strip()[:100]}"
+        except Exception as e:
+            results[svc] = f"error: {e}"
+    return {"results": results}

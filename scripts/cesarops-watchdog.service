@@ -1,0 +1,35 @@
+[Unit]
+Description=CESAROPS Service Watchdog
+Documentation=https://cesarops.com
+After=network.target wrecks-api.service koboldcpp.service
+Wants=wrecks-api.service koboldcpp.service
+
+[Service]
+Type=simple
+User=cesarops
+Group=cesarops
+WorkingDirectory=/home/cesarops/wreckhunter2000-1
+
+ExecStart=/home/cesarops/tpu-venv/bin/python /home/cesarops/wreckhunter2000-1/watchdog.py
+
+TimeoutStopSec=10
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+Restart=always
+RestartSec=15
+
+EnvironmentFile=-/home/cesarops/wreckhunter2000-1/.env
+Environment="WATCHDOG_POLL_SECS=30"
+Environment="WATCHDOG_API_PORT=8099"
+Environment="WATCHDOG_KOBOLD_PORT=5001"
+
+CPUQuota=5%
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cesarops-watchdog
+
+[Install]
+WantedBy=multi-user.target

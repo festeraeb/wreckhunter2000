@@ -1,0 +1,45 @@
+[Unit]
+Description=CESAROPS Wrecks API (FastAPI/uvicorn)
+Documentation=https://cesarops.com
+After=network.target
+# Restart before the scan worker so it's ready when the worker starts
+Before=scan-worker.service cesarops-watchdog.service
+
+[Service]
+Type=simple
+User=cesarops
+Group=cesarops
+WorkingDirectory=/home/cesarops/wreckhunter2000-1
+
+ExecStart=/home/cesarops/tpu-venv/bin/python -m uvicorn \
+    wrecks_api.app:app \
+    --host 0.0.0.0 \
+    --port 8099 \
+    --workers 2 \
+    --log-level warning
+
+# Graceful stop
+TimeoutStopSec=15
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+# Always restart — this is a critical service
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+EnvironmentFile=-/home/cesarops/wreckhunter2000-1/.env
+Environment="DB_PATH=/home/cesarops/wreckhunter2000-1/db/wrecks.db"
+Environment="API_BASE_URL=http://localhost:8099"
+
+# Resource limits — leave headroom for GPU workers
+CPUQuota=60%
+MemoryMax=2G
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wrecks-api
+
+[Install]
+WantedBy=multi-user.target

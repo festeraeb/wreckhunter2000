@@ -146,6 +146,37 @@ export interface ScanResultsResponse {
   total_signatures?: number;
 }
 
+export interface YesterdayFindsSummary {
+  date: string;
+  job_count: number;
+  total_candidates: number;
+  total_signatures: number;
+  top_tools: Array<{ tool: string; count: number }>;
+  top_candidates: Array<{
+    job_id: string;
+    source_file: string;
+    latitude?: number | null;
+    longitude?: number | null;
+    confidence?: number | null;
+    anomaly_score?: number | null;
+    method: string;
+    size_sq_feet?: number | null;
+    size_sq_meters?: number | null;
+  }>;
+  research_jobs: Array<{
+    job_id: string;
+    status: string;
+    created_at: string;
+    finished_at?: string | null;
+    output_dir: string;
+    research_mode: boolean;
+    research_notes: string;
+    config: Record<string, unknown>;
+    total_candidates: number;
+    total_signatures: number;
+  }>;
+}
+
 export interface PdfBreakerRequest {
   paths: string[];
   output_dir?: string;
@@ -336,9 +367,36 @@ export interface HarvesterResult {
   warp_applied: boolean;
   errors: string[];
 }
-
+export interface HardwareInfo {
+  cpu: {
+    usage_percent?: number;
+    count?: number;
+    frequency_mhz?: number;
+    memory_used_gb?: number;
+    memory_total_gb?: number;
+    memory_percent?: number;
+    error?: string;
+  };
+  gpu: {
+    nvidia?: Array<{
+      temperature_c: number;
+      utilization_percent: number;
+      memory_used_mb: number;
+      memory_total_mb: number;
+      power_draw_w: number;
+      power_limit_w: number;
+    }>;
+    error?: string;
+  };
+  nvidia_smi: {
+    output?: string;
+    error?: string;
+  };
+}
 // ActivePanel — all top-level panel routes
 export type ActivePanel =
+  | "search"
   | "list" | "detail" | "stats" | "scan" | "mag" | "erie"
   | "restore" | "pdf" | "map" | "export" | "loran" | "sensors"
-  | "harvest" | "agent" | "mission";
+  | "harvest" | "agent" | "mission" | "satellite" | "workers" | "earth"
+  | "idle" | "scan-output" | "hardware" | "coder" | "kobold";

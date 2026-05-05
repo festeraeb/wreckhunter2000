@@ -22,16 +22,23 @@ import SatelliteTrackerPanel from "./components/SatelliteTrackerPanel";
 import AutoBagPrompt from "./components/AutoBagPrompt";
 import UpdateChecker from "./components/UpdateChecker";
 import WorkerStatusPanel from "./components/WorkerStatusPanel";
+import IdleControlPanel from "./components/IdleControlPanel";
+import ScanOutputPanel from "./components/ScanOutputPanel";
+import HardwareDashboard from "./components/HardwareDashboard";
+import KoboldAgentPanel from "./components/KoboldAgentPanel";
+import SearchPanel from "./components/SearchPanel";
 import { getApiBase, resetConnectionState } from "./services/api";
 import "./styles/global.css";
 
 // Panels accessible without authentication
-const PUBLIC_PANELS: ActivePanel[] = ["stats", "list", "map", "satellite", "detail"];
+const PUBLIC_PANELS: ActivePanel[] = ["stats", "list", "map", "satellite", "detail", "scan-output", "search"];
 
 export default function App() {
-  const [unlocked, setUnlocked] = useState(false);
-  const [showGate, setShowGate] = useState(false);
-  const [panel, setPanel] = useState<ActivePanel>("stats");
+  // Restore session immediately — don't wait for a locked panel to be clicked
+  const [unlocked, setUnlocked] = useState(() => sessionStorage.getItem("wh2k_unlocked") === "1");
+  // Show gate on startup if not already unlocked via session
+  const [showGate, setShowGate] = useState(() => sessionStorage.getItem("wh2k_unlocked") !== "1");
+  const [panel, setPanel] = useState<ActivePanel>("search");
   const [selectedWreck, setSelectedWreck] = useState<Wreck | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [online, setOnline] = useState<boolean | null>(null);
@@ -130,6 +137,9 @@ export default function App() {
       {/* ── Sidebar ────────────────────────────────────── */}
       <div className="sidebar">
         <div className="section-label">Intelligence</div>
+        <button className={panel === "search" ? "active" : ""} onClick={() => setPanel("search")}>
+          🔍 Search & Rescue
+        </button>
         <button className={panel === "stats" ? "active" : ""} onClick={() => setPanel("stats")}>
           📊 Dashboard
         </button>
@@ -169,8 +179,17 @@ export default function App() {
         <button className={panel === "agent" ? "active" : ""} onClick={() => handleSetPanel("agent")}>
           🤖 AI Director
         </button>
+        <button className={panel === "kobold" ? "active" : ""} onClick={() => handleSetPanel("kobold")}>
+          🤖 Kobold Agent
+        </button>
         <button className={panel === "workers" ? "active" : ""} onClick={() => handleSetPanel("workers")}>
           ⚙️ Node Status
+        </button>
+        <button className={panel === "idle" ? "active" : ""} onClick={() => handleSetPanel("idle")}>
+          💤 Idle Controller
+        </button>
+        <button className={panel === "scan-output" ? "active" : ""} onClick={() => setPanel("scan-output")}>
+          📍 Scan Output
         </button>
 
         <div className="section-label">
@@ -233,6 +252,9 @@ export default function App() {
 
       {/* ── Main content ───────────────────────────────── */}
       <div className="main-content">
+        <div style={{ display: panel === "search" ? "block" : "none", height: '100%' }}>
+          <SearchPanel />
+        </div>
         <div style={{ display: panel === "stats" ? "block" : "none", height: '100%' }}>
           <StatsPanel />
         </div>
@@ -288,8 +310,17 @@ export default function App() {
         <div style={{ display: panel === "agent" ? "block" : "none", height: '100%' }}>
           <AgentPanel />
         </div>
+        <div style={{ display: panel === "kobold" ? "block" : "none", height: '100%' }}>
+          <KoboldAgentPanel />
+        </div>
         <div style={{ display: panel === "mission" ? "block" : "none", height: '100%' }}>
           <MissionControlPanel />
+        </div>
+        <div style={{ display: panel === "idle" ? "block" : "none", height: '100%' }}>
+          <IdleControlPanel />
+        </div>
+        <div style={{ display: panel === "scan-output" ? "block" : "none", height: '100%' }}>
+          <ScanOutputPanel />
         </div>
         <div style={{ display: panel === "detail" ? "block" : "none", height: '100%' }}>
           {selectedWreck && <WreckDetail wreck={selectedWreck} onBack={() => setPanel("list")} />}

@@ -1,0 +1,58 @@
+[Unit]
+Description=KoboldCPP LLM Inference Server
+Documentation=https://github.com/LostRuins/koboldcpp
+After=network.target
+# Start after the API so the API can report kobold status correctly
+After=wrecks-api.service
+
+[Service]
+Type=simple
+User=cesarops
+Group=cesarops
+WorkingDirectory=/home/cesarops/wreckhunter2000-1
+
+# ExecStartPre finds the binary and model, writes them to /tmp/kobold-cmd.sh
+ExecStartPre=/bin/bash -c '\
+    BIN=""; \
+    for p in \
+        "$HOME/ai_coding/koboldcpp" \
+        "$HOME/koboldcpp/koboldcpp" \
+        "$HOME/koboldcpp" \
+        "/opt/koboldcpp/koboldcpp-linux-x64" \
+        "/opt/koboldcpp/koboldcpp" \
+        "/usr/local/bin/koboldcpp"; \
+    do [ -f "$p" ] && BIN="$p" && break; done; \
+    [ -z "$BIN" ] && echo "KoboldCPP binary not found" && exit 1; \
+    MODEL="${WATCHDOG_KOBOLD_MODEL}"; \
+    if [ -z "$MODEL" ]; then \
+        for d in /mnt/garmour/models /mnt/data/models "$HOME/models" /models; do \
+            F=$(find "$d" -name "*.gguf" -printf "%s %p\n" 2>/dev/null | sort -rn | head -1 | cut -d" " -f2-); \
+            [ -n "$F" ] && MODEL="$F" && break; \
+        done; \
+    fi; \
+    [ -z "$MODEL" ] && echo "No .gguf model found" && exit 1; \
+    LAYERS="${WATCHDOG_KOBOLD_LAYERS:-28}"; \
+    echo "exec $BIN --model $MODEL --port 5001 --gpulayers $LAYERS --contextsize 4096 --threads 8" > /tmp/kobold-cmd.sh; \
+    chmod +x /tmp/kobold-cmd.sh'
+
+ExecStart=/bin/bash /tmp/kobold-cmd.sh
+
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+EnvironmentFile=-/home/cesarops/wreckhunter2000-1/.env
+
+# KoboldCPP needs the GPU — no CPU/memory caps here
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=koboldcpp
+
+[Install]
+WantedBy=multi-user.target
