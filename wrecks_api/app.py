@@ -37,9 +37,20 @@ for _sub in ("pipelines/mag", "pipelines/satellite", "pipelines/bag",
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
+
+# UploadFile / File / Form require python-multipart — import lazily so the API
+# starts even if the package is absent (upload endpoint will return a clear error)
+try:
+    from fastapi import UploadFile, File, Form
+    _MULTIPART_OK = True
+except Exception:
+    _MULTIPART_OK = False
+    UploadFile = None  # type: ignore
+    File = None        # type: ignore
+    Form = None        # type: ignore
 from pydantic import BaseModel
 import threading
 import multiprocessing as mp
@@ -3171,32 +3182,42 @@ def kobold_download_status(job_id: str):
 
 
 @app.post("/kobold/upload-model", tags=["kobold"])
-async def kobold_upload_model(
-    file: UploadFile = File(...),
-    save_path: str = Form("/mnt/garmour/models"),
-):
+async def kobold_upload_model(request: "Request"):
     """
     Accept a .gguf or .onnx file upload from the browser and save it to
-    the server's model directory (save_path).
+    the server's model directory.  Requires python-multipart to be installed.
     """
-    import shutil as _shutil
+    from fastapi import Request as _Request
+    if not _MULTIPART_OK:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "File upload requires python-multipart. "
+                "Install it on the server: pip install python-multipart"
+            ),
+        )
 
-    # Validate extension
-    filename = file.filename or ""
+    import shutil as _shutil
+    form = await request.form()
+    file = form.get("file")
+    save_path = form.get("save_path", "/mnt/garmour/models")
+
+    if file is None:
+        raise HTTPException(status_code=400, detail="No file field in form data")
+
+    filename = getattr(file, "filename", None) or ""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ("gguf", "onnx"):
         raise HTTPException(status_code=400, detail="Only .gguf and .onnx files are accepted")
 
-    # Validate save_path stays within allowed mounts
-    allowed_prefixes = ("/mnt/garmour", "/mnt/data", "/home", "/models", "C:\\", "D:\\")
-    if not any(save_path.startswith(p) for p in allowed_prefixes):
+    allowed_prefixes = ("/mnt/garmour", "/mnt/data", "/home", "/models", "/opt", "/root", "C:\\", "D:\\")
+    if not any(str(save_path).startswith(p) for p in allowed_prefixes):
         raise HTTPException(status_code=400, detail="save_path must be within an allowed directory")
 
-    dest_dir = Path(save_path)
+    dest_dir = Path(str(save_path))
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_file = dest_dir / filename
 
-    # Stream to disk
     try:
         with open(dest_file, "wb") as out:
             _shutil.copyfileobj(file.file, out)
