@@ -2939,10 +2939,11 @@ _ALLOWED_MODELS = {
 
 class KoboldLaunchRequest(BaseModel):
     model: str
-    gpu_mode: str = "p100_single"
-    model_path: str = "/mnt/garmour/models"
+    gpu_mode: str = "p100_dual"
+    model_path: str = "/home/cesarops/models"
     port: int = 5001
     reasoning_model: str = ""
+    backend: str = "cublas"   # cublas | vulkan | cpu
 
 
 class KoboldDownloadRequest(BaseModel):

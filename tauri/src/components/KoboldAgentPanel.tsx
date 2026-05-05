@@ -2,9 +2,10 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { getApiBase } from "../services/api";
 
 export default function KoboldAgentPanel() {
-  const [koboldUrl, setKoboldUrl]           = useState("http://localhost:5001/v1");
-  const [model, setModel]                   = useState("Qwen2.5-Coder-7B-Instruct");
-  const [gpuMode, setGpuMode]               = useState("p100_single");
+  const [koboldUrl, setKoboldUrl]           = useState("http://10.0.0.61:5001/v1");
+  const [model, setModel]                   = useState("Qwen2.5-Coder-14B-Instruct");
+  const [gpuMode, setGpuMode]               = useState("p100_dual");
+  const [backend, setBackend]               = useState("cublas");
   const [reasoningModel, setReasoningModel] = useState("");
   const [huggingfaceModel, setHuggingfaceModel] = useState("");
   const [garmourPath, setGarmourPath]       = useState("/mnt/garmour/models");
@@ -118,7 +119,7 @@ export default function KoboldAgentPanel() {
       const response = await fetch(`${apiBase}/kobold/launch`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, gpu_mode: gpuMode, model_path: garmourPath, port: 5001 }),
+        body: JSON.stringify({ model, gpu_mode: gpuMode, model_path: garmourPath, port: 5001, backend }),
       });
       if (response.ok) {
         const data = await response.json();
@@ -210,10 +211,27 @@ export default function KoboldAgentPanel() {
   };
 
   const getRecommendedModels = () => {
-    if (gpuMode === "both") {
-      return ["Qwen2.5-Coder-14B-Instruct", "DeepSeek-Coder-V2-Lite-Instruct", "CodeLlama-13B-Instruct"];
+    if (gpuMode === "p100_dual") {
+      return [
+        "Qwen2.5-Coder-14B-Instruct",
+        "DeepSeek-Coder-V2-Lite-Instruct",
+        "CodeLlama-13B-Instruct",
+      ];
+    } else if (gpuMode === "mixed_p100_1070") {
+      // P1000 4GB — small routing/doorbell models only
+      return [
+        "Phi-3-mini-4k-instruct",
+        "Qwen2.5-Coder-1.5B-Instruct",
+        "TinyLlama-1.1B",
+      ];
     }
-    return ["Qwen2.5-Coder-7B-Instruct", "DeepSeek-R1-Distill-Qwen-7B", "CodeLlama-7B-Instruct", "StarCoder2-7B"];
+    // p100_single
+    return [
+      "Qwen2.5-Coder-7B-Instruct",
+      "DeepSeek-R1-Distill-Qwen-7B",
+      "CodeLlama-7B-Instruct",
+      "StarCoder2-7B",
+    ];
   };
 
   // ── Status box colours (dark-theme safe) ────────────────────────────────────
@@ -326,12 +344,25 @@ export default function KoboldAgentPanel() {
 
       {/* ── GPU mode ──────────────────────────────────────────────────────── */}
       <div className="form-group">
-        <label style={{ color: "var(--text-dim)" }}>Primary GPU:</label>
+        <label style={{ color: "var(--text-dim)" }}>Node / GPU:</label>
         <select value={gpuMode} onChange={e => setGpuMode(e.target.value)}>
-          <option value="p100_single">Single P100 (7B models)</option>
-          <option value="p100_dual">Dual P100 (14B models)</option>
-          <option value="mixed_p100_1070">P100 + GTX 1070/1060</option>
+          <option value="p100_dual">T440 — Dual P100 16GB (32GB total, 14B models)</option>
+          <option value="p100_single">T440 — Single P100 16GB (7B models)</option>
+          <option value="mixed_p100_1070">i7 — P1000 4GB (small/routing models)</option>
         </select>
+      </div>
+
+      {/* ── Compute backend ───────────────────────────────────────────────── */}
+      <div className="form-group">
+        <label style={{ color: "var(--text-dim)" }}>Compute Backend:</label>
+        <select value={backend} onChange={e => setBackend(e.target.value)}>
+          <option value="cublas">CUDA / cuBLAS (P100 — recommended)</option>
+          <option value="vulkan">Vulkan / wgpu (fallback, any GPU)</option>
+          <option value="cpu">CPU only</option>
+        </select>
+        <small style={{ color: "var(--text-dim)" }}>
+          cuBLAS = fastest on P100. Vulkan = wgpu-compatible, works without CUDA drivers.
+        </small>
       </div>
 
       {gpuMode === "mixed_p100_1070" && (
