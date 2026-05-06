@@ -1,0 +1,56 @@
+[package]
+name = "nautivecs"
+version = "0.1.0"
+edition = "2021"
+authors = ["CESAROPS"]
+description = "AST-aware code vectorization and semantic retrieval engine for local LLM context injection"
+license = "MIT"
+repository = "https://github.com/cesarops/nautivecs"
+keywords = ["vector-search", "embeddings", "code-search", "llm", "rag"]
+categories = ["development-tools", "science", "text-processing"]
+
+[lib]
+name = "nautivecs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nautivecs-cli"
+path = "src/main.rs"
+
+[dependencies]
+# AST parsing — structural code chunking
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+
+# HTTP client for external embedding endpoints (KoboldCPP, OpenAI-compatible)
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+
+[features]
+default = ["remote-embeddings"]
+# Use an external API for embeddings (KoboldCPP, OpenAI, etc.)
+remote-embeddings = []
+# Use local llama.cpp for embeddings (requires CUDA/Metal build)
+# local-embeddings = ["llama-cpp-2"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
